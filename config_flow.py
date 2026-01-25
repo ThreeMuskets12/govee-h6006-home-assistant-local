@@ -10,6 +10,7 @@ from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import aiohttp_client
+import homeassistant.helpers.config_validation as cv
 
 from .api import ESP32BulbRelayApi, ESP32BulbRelayApiError
 from .const import (
@@ -40,6 +41,15 @@ class ESP32BulbRelayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             host = user_input[CONF_ESP32_HOST].strip()
+            
+            # Sanitize input - remove http:// or https:// if present
+            host = host.removeprefix("http://").removeprefix("https://")
+            # Remove trailing slash if present
+            host = host.rstrip("/")
+            # Remove port if included (we use default port)
+            if ":" in host:
+                host = host.split(":")[0]
+            
             self._host = host
 
             # Check if already configured
@@ -110,13 +120,13 @@ class ESP32BulbRelayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         Bulb format from API: {"id": 0, "name": "lamp", "address": "...", "connected": true}
         """
         bulb_names = [bulb["name"] for bulb in self._discovered_bulbs if "name" in bulb]
+        
+        # Create dict for multi_select: {value: label}
+        bulb_options = {name: name for name in bulb_names}
 
         return vol.Schema(
             {
-                vol.Required(CONF_BULBS, default=bulb_names): vol.All(
-                    vol.Coerce(list),
-                    [vol.In(bulb_names)],
-                ),
+                vol.Required(CONF_BULBS, default=bulb_names): cv.multi_select(bulb_options),
             }
         )
 
@@ -195,12 +205,11 @@ class ESP32BulbRelayOptionsFlow(config_entries.OptionsFlow):
                 key = f"bulbs_{host.replace('.', '_')}"
                 
                 if bulb_names:
+                    # Create dict for multi_select: {value: label}
+                    bulb_options = {name: name for name in bulb_names}
                     schema_dict[
                         vol.Optional(key, default=current_selection)
-                    ] = vol.All(
-                        vol.Coerce(list),
-                        [vol.In(bulb_names)],
-                    )
+                    ] = cv.multi_select(bulb_options)
             except ESP32BulbRelayApiError:
                 _LOGGER.warning("Could not connect to %s", host)
                 errors[f"bulbs_{host}"] = "cannot_connect"
@@ -225,6 +234,15 @@ class ESP32BulbRelayOptionsFlow(config_entries.OptionsFlow):
 
         if user_input is not None:
             host = user_input[CONF_ESP32_HOST].strip()
+            
+            # Sanitize input - remove http:// or https:// if present
+            host = host.removeprefix("http://").removeprefix("https://")
+            # Remove trailing slash if present
+            host = host.rstrip("/")
+            # Remove port if included (we use default port)
+            if ":" in host:
+                host = host.split(":")[0]
+            
             self._host_to_add = host
 
             existing_hosts = list(self._config_entry.data.get(CONF_ESP32_HOSTS, []))
@@ -291,15 +309,15 @@ class ESP32BulbRelayOptionsFlow(config_entries.OptionsFlow):
         # Build selection schema
         # Bulb format: {"id": 0, "name": "lamp", "address": "...", "connected": true}
         bulb_names = [bulb["name"] for bulb in self._discovered_bulbs if "name" in bulb]
+        
+        # Create dict for multi_select: {value: label}
+        bulb_options = {name: name for name in bulb_names}
 
         return self.async_show_form(
             step_id="select_new_bulbs",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_BULBS, default=bulb_names): vol.All(
-                        vol.Coerce(list),
-                        [vol.In(bulb_names)],
-                    ),
+                    vol.Required(CONF_BULBS, default=bulb_names): cv.multi_select(bulb_options),
                 }
             ),
             description_placeholders={

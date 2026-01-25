@@ -4,7 +4,7 @@
     "step": {
       "user": {
         "title": "Add ESP32 Bulb Relay",
-        "description": "Enter the IP address of your ESP32 Bulb Relay device. The device must be connected to your network and accessible.",
+        "description": "Enter the IP address of your ESP32 Bulb Relay device (e.g., 192.168.1.100). The device must be connected to your network and accessible.",
         "data": {
           "esp32_host": "ESP32 IP Address"
         }
