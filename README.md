@@ -9,6 +9,7 @@ A Home Assistant custom integration for controlling smart lights via ESP32 Bulb 
 - **Proper Color Modes**: Separate RGB and Color Temperature modes (no RGBW encoding)
 - **Flexible Configuration**: Add/remove bulbs and ESP32 devices through the UI
 - **Debug Commands**: Manual connect/disconnect for troubleshooting (settings only)
+- **Command Queue**: Built-in rate limiting (500ms between commands) to prevent overwhelming the ESP32
 
 ## Installation
 
@@ -167,6 +168,24 @@ Each light entity exposes the following attributes:
 | `address` | The bulb's Bluetooth MAC address |
 | `connected` | Whether the bulb is currently connected |
 | `esp32_host` | The IP address of the ESP32 this bulb is connected to |
+
+## Command Queue & Rate Limiting
+
+The integration includes a built-in command queue to prevent overwhelming the ESP32 with rapid requests. Commands are processed with a minimum 500ms delay between each one.
+
+**How it works:**
+- Each ESP32 has its own independent command queue
+- Commands (on, off, brightness, color, temperature) are queued and executed sequentially
+- Status polling (`/bulbs` endpoint) is NOT rate-limited to ensure timely updates
+- If multiple commands are sent quickly (e.g., sliding a brightness slider), they queue up and execute in order
+
+**Example scenario:**
+1. User rapidly adjusts brightness from 0% to 100%
+2. Multiple brightness commands queue up
+3. Commands execute one by one, 500ms apart
+4. ESP32 receives a manageable stream of requests
+
+The 500ms interval can be adjusted by modifying `MIN_COMMAND_INTERVAL` in `const.py`.
 
 ## Troubleshooting
 

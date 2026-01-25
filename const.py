@@ -32,6 +32,9 @@ MAX_BRIGHTNESS = 100
 # Update interval in seconds
 UPDATE_INTERVAL = 30
 
+# Minimum interval between commands to ESP32 (in seconds)
+MIN_COMMAND_INTERVAL = 0.5  # 500ms
+
 # Services
 SERVICE_CONNECT_BULB = "connect_bulb"
 SERVICE_DISCONNECT_BULB = "disconnect_bulb"

@@ -19,6 +19,7 @@ from .const import (
     DEFAULT_PORT,
     DEFAULT_TIMEOUT,
 )
+from .queue import CommandQueue
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class ESP32BulbRelayApi:
         self._timeout = timeout
         self._base_url = f"http://{host}:{port}"
         self._owns_session = False
+        self._command_queue = CommandQueue()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create the aiohttp session."""
@@ -61,7 +63,8 @@ class ESP32BulbRelayApi:
         return self._session
 
     async def close(self) -> None:
-        """Close the session if we own it."""
+        """Close the session and stop the queue."""
+        await self._command_queue.stop()
         if self._owns_session and self._session:
             await self._session.close()
             self._session = None
@@ -93,6 +96,12 @@ class ESP32BulbRelayApi:
                 f"Error parsing response from {self._host}: {err}"
             ) from err
 
+    async def _queued_request(self, endpoint: str) -> dict[str, Any]:
+        """Make a rate-limited request through the command queue."""
+        return await self._command_queue.enqueue(
+            lambda: self._request(endpoint)
+        )
+
     def _check_success(self, result: dict[str, Any], action: str) -> None:
         """Check if the command was successful."""
         if not result.get("success", False):
@@ -104,6 +113,11 @@ class ESP32BulbRelayApi:
     def host(self) -> str:
         """Return the host."""
         return self._host
+
+    @property
+    def pending_commands(self) -> int:
+        """Return the number of pending commands in the queue."""
+        return self._command_queue.pending_count
 
     async def get_bulbs(self) -> list[dict[str, Any]]:
         """Get list of all bulbs from the ESP32.
@@ -117,6 +131,8 @@ class ESP32BulbRelayApi:
         }
         
         Returns list of bulb dicts with keys: id, name, address, connected
+        
+        Note: This is NOT rate-limited as it's used for status polling.
         """
         result = await self._request(API_BULBS)
         
@@ -131,7 +147,7 @@ class ESP32BulbRelayApi:
         Expected response: {"success": true, "bulb": "lamp", "action": "on"}
         """
         endpoint = API_BULB_ON.format(name=bulb_name)
-        result = await self._request(endpoint)
+        result = await self._queued_request(endpoint)
         self._check_success(result, "on")
         return result
 
@@ -141,7 +157,7 @@ class ESP32BulbRelayApi:
         Expected response: {"success": true, "bulb": "lamp", "action": "off"}
         """
         endpoint = API_BULB_OFF.format(name=bulb_name)
-        result = await self._request(endpoint)
+        result = await self._queued_request(endpoint)
         self._check_success(result, "off")
         return result
 
@@ -152,7 +168,7 @@ class ESP32BulbRelayApi:
         """
         brightness = max(0, min(100, brightness))
         endpoint = API_BULB_BRIGHTNESS.format(name=bulb_name, value=brightness)
-        result = await self._request(endpoint)
+        result = await self._queued_request(endpoint)
         self._check_success(result, "brightness")
         return result
 
@@ -165,7 +181,7 @@ class ESP32BulbRelayApi:
         g = max(0, min(255, g))
         b = max(0, min(255, b))
         endpoint = API_BULB_RGB.format(name=bulb_name, r=r, g=g, b=b)
-        result = await self._request(endpoint)
+        result = await self._queued_request(endpoint)
         self._check_success(result, "rgb")
         return result
 
@@ -176,7 +192,7 @@ class ESP32BulbRelayApi:
         """
         temperature = max(2000, min(9000, temperature))
         endpoint = API_BULB_TEMPERATURE.format(name=bulb_name, value=temperature)
-        result = await self._request(endpoint)
+        result = await self._queued_request(endpoint)
         self._check_success(result, "temperature")
         return result
 
@@ -186,7 +202,7 @@ class ESP32BulbRelayApi:
         Expected response: {"success": true, "bulb": "lamp", "action": "connect"}
         """
         endpoint = API_BULB_CONNECT.format(name=bulb_name)
-        result = await self._request(endpoint)
+        result = await self._queued_request(endpoint)
         self._check_success(result, "connect")
         return result
 
@@ -196,7 +212,7 @@ class ESP32BulbRelayApi:
         Expected response: {"success": true, "bulb": "lamp", "action": "disconnect"}
         """
         endpoint = API_BULB_DISCONNECT.format(name=bulb_name)
-        result = await self._request(endpoint)
+        result = await self._queued_request(endpoint)
         self._check_success(result, "disconnect")
         return result
 
