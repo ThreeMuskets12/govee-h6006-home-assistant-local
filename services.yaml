@@ -1,0 +1,41 @@
+connect_bulb:
+  name: Connect Bulb
+  description: Reconnect a disconnected bulb. This is a debug command and should only be used when troubleshooting.
+  fields:
+    esp32_host:
+      name: ESP32 Host
+      description: The IP address of the ESP32 that the bulb is connected to.
+      required: true
+      example: "192.168.1.100"
+      selector:
+        text:
+    bulb_name:
+      name: Bulb Name
+      description: The name of the bulb to connect.
+      required: true
+      example: "Living Room"
+      selector:
+        text:
+
+disconnect_bulb:
+  name: Disconnect Bulb
+  description: Disconnect a bulb from the ESP32. This is a debug command. WARNING - The bulb will not respond to commands until reconnected.
+  fields:
+    esp32_host:
+      name: ESP32 Host
+      description: The IP address of the ESP32 that the bulb is connected to.
+      required: true
+      example: "192.168.1.100"
+      selector:
+        text:
+    bulb_name:
+      name: Bulb Name
+      description: The name of the bulb to disconnect.
+      required: true
+      example: "Living Room"
+      selector:
+        text:
+
+refresh_bulbs:
+  name: Refresh Bulbs
+  description: Force a refresh of all bulb states from all configured ESP32 devices.

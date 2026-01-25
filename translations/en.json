@@ -1,0 +1,143 @@
+{
+  "title": "ESP32 Bulb Relay",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add ESP32 Bulb Relay",
+        "description": "Enter the IP address of your ESP32 Bulb Relay device. The device must be connected to your network and accessible.",
+        "data": {
+          "esp32_host": "ESP32 IP Address"
+        }
+      },
+      "select_bulbs": {
+        "title": "Select Bulbs",
+        "description": "Select which bulbs you want to add to Home Assistant. You can change this later in the integration settings.",
+        "data": {
+          "bulbs": "Bulbs to Add"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to ESP32. Please check the IP address and ensure the device is online.",
+      "no_bulbs": "No bulbs found on this ESP32. Please ensure bulbs are connected.",
+      "no_bulbs_selected": "Please select at least one bulb to add.",
+      "unknown": "An unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "This ESP32 is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "ESP32 Bulb Relay Settings",
+        "description": "Configure your ESP32 Bulb Relay integration.",
+        "menu_options": {
+          "manage_bulbs": "Manage Bulbs",
+          "add_esp32": "Add ESP32",
+          "remove_esp32": "Remove ESP32",
+          "debug_commands": "Debug Commands (Connect/Disconnect)"
+        }
+      },
+      "manage_bulbs": {
+        "title": "Manage Bulbs",
+        "description": "Select which bulbs should be enabled in Home Assistant. Configured hosts: {hosts}"
+      },
+      "add_esp32": {
+        "title": "Add ESP32",
+        "description": "Add another ESP32 Bulb Relay device to this integration.",
+        "data": {
+          "esp32_host": "ESP32 IP Address"
+        }
+      },
+      "select_new_bulbs": {
+        "title": "Select Bulbs from {host}",
+        "description": "Found {count} bulb(s) on this ESP32. Select which ones to add.",
+        "data": {
+          "bulbs": "Bulbs to Add"
+        }
+      },
+      "remove_esp32": {
+        "title": "Remove ESP32",
+        "description": "Select an ESP32 to remove from this integration. This will remove all bulbs associated with it.",
+        "data": {
+          "host_to_remove": "ESP32 to Remove"
+        }
+      },
+      "debug_commands": {
+        "title": "Debug Commands",
+        "description": "These commands are for debugging purposes only. Use with caution.",
+        "menu_options": {
+          "debug_connect": "Connect Bulb",
+          "debug_disconnect": "Disconnect Bulb"
+        }
+      },
+      "debug_connect": {
+        "title": "Connect Bulb",
+        "description": "Manually connect/reconnect a bulb. This is a debug command.",
+        "data": {
+          "bulb": "Bulb to Connect"
+        }
+      },
+      "debug_disconnect": {
+        "title": "Disconnect Bulb",
+        "description": "Manually disconnect a bulb. This is a debug command. WARNING: The bulb will not respond until reconnected.",
+        "data": {
+          "bulb": "Bulb to Disconnect"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to ESP32.",
+      "already_configured": "This ESP32 is already configured.",
+      "no_bulbs": "No bulbs found on this ESP32.",
+      "command_failed": "The command failed. Please check the connection."
+    },
+    "abort": {
+      "no_hosts": "No ESP32 hosts configured.",
+      "cannot_remove_last": "Cannot remove the last ESP32. Delete the integration instead.",
+      "no_bulbs": "No bulbs available."
+    }
+  },
+  "services": {
+    "connect_bulb": {
+      "name": "Connect Bulb",
+      "description": "Reconnect a disconnected bulb (debug command).",
+      "fields": {
+        "esp32_host": {
+          "name": "ESP32 Host",
+          "description": "IP address of the ESP32."
+        },
+        "bulb_name": {
+          "name": "Bulb Name",
+          "description": "Name of the bulb to connect."
+        }
+      }
+    },
+    "disconnect_bulb": {
+      "name": "Disconnect Bulb",
+      "description": "Disconnect a bulb (debug command).",
+      "fields": {
+        "esp32_host": {
+          "name": "ESP32 Host",
+          "description": "IP address of the ESP32."
+        },
+        "bulb_name": {
+          "name": "Bulb Name",
+          "description": "Name of the bulb to disconnect."
+        }
+      }
+    },
+    "refresh_bulbs": {
+      "name": "Refresh Bulbs",
+      "description": "Force refresh the status of all bulbs."
+    }
+  },
+  "entity": {
+    "light": {
+      "bulb": {
+        "name": "{bulb_name}"
+      }
+    }
+  }
+}
