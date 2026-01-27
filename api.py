@@ -297,16 +297,25 @@ class ESP32BulbRelaySerialApi:
 
 
 async def list_serial_ports() -> list[dict[str, str]]:
-    """List available serial ports."""
-    import serial.tools.list_ports
+    """List available serial ports.
     
-    ports = []
-    for port in serial.tools.list_ports.comports():
-        ports.append({
-            "device": port.device,
-            "description": port.description,
-            "hwid": port.hwid,
-            "name": f"{port.device} - {port.description}" if port.description else port.device,
-        })
+    This runs in an executor to avoid blocking the event loop.
+    """
+    import asyncio
     
-    return ports
+    def _list_ports() -> list[dict[str, str]]:
+        import serial.tools.list_ports
+        
+        ports = []
+        for port in serial.tools.list_ports.comports():
+            ports.append({
+                "device": port.device,
+                "description": port.description,
+                "hwid": port.hwid,
+                "name": f"{port.device} - {port.description}" if port.description else port.device,
+            })
+        
+        return ports
+    
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _list_ports)

@@ -10,7 +10,6 @@ from homeassistant.components.light import (
     ATTR_RGB_COLOR,
     ColorMode,
     LightEntity,
-    LightEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -18,10 +17,10 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .api import ESP32BulbRelayApi, ESP32BulbRelayApiError
+from .api import ESP32BulbRelaySerialApi, ESP32BulbRelayApiError
 from .const import (
     CONF_BULBS,
-    CONF_ESP32_HOSTS,
+    CONF_SERIAL_PORTS,
     DOMAIN,
     MAX_COLOR_TEMP_KELVIN,
     MIN_COLOR_TEMP_KELVIN,
@@ -39,14 +38,14 @@ async def async_setup_entry(
     """Set up ESP32 Bulb Relay lights from a config entry."""
     coordinator: ESP32BulbRelayCoordinator = hass.data[DOMAIN][config_entry.entry_id]
     
-    hosts = config_entry.data.get(CONF_ESP32_HOSTS, [])
+    ports = config_entry.data.get(CONF_SERIAL_PORTS, [])
     bulb_config = config_entry.options.get(CONF_BULBS, {})
     
     entities: list[ESP32BulbRelayLight] = []
     
-    for host in hosts:
-        enabled_bulbs = bulb_config.get(host, [])
-        api = coordinator.get_api(host)
+    for port in ports:
+        enabled_bulbs = bulb_config.get(port, [])
+        api = coordinator.get_api(port)
         
         if api is None:
             continue
@@ -55,7 +54,7 @@ async def async_setup_entry(
             entities.append(
                 ESP32BulbRelayLight(
                     coordinator=coordinator,
-                    host=host,
+                    port=port,
                     bulb_name=bulb_name,
                     api=api,
                 )
@@ -87,28 +86,28 @@ class ESP32BulbRelayLight(CoordinatorEntity[ESP32BulbRelayCoordinator], LightEnt
     def __init__(
         self,
         coordinator: ESP32BulbRelayCoordinator,
-        host: str,
+        port: str,
         bulb_name: str,
-        api: ESP32BulbRelayApi,
+        api: ESP32BulbRelaySerialApi,
     ) -> None:
         """Initialize the light."""
         super().__init__(coordinator)
         
-        self._host = host
+        self._port = port
         self._bulb_name = bulb_name
         self._api = api
         
         # Entity attributes
-        self._attr_unique_id = f"{host}_{bulb_name}".replace(".", "_").replace(" ", "_")
+        self._attr_unique_id = f"{port}_{bulb_name}".replace("/", "_").replace(".", "_").replace(" ", "_")
         self._attr_name = bulb_name
         
         # Device info
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{host}_{bulb_name}")},
+            identifiers={(DOMAIN, f"{port}_{bulb_name}")},
             name=f"{bulb_name}",
             manufacturer="ESP32 Bulb Relay",
             model="Smart Bulb",
-            via_device=(DOMAIN, host),
+            via_device=(DOMAIN, port),
         )
         
         # State tracking
@@ -128,12 +127,12 @@ class ESP32BulbRelayLight(CoordinatorEntity[ESP32BulbRelayCoordinator], LightEnt
         if self.coordinator.data is None:
             return False
         
-        host_data = self.coordinator.data.get("hosts", {}).get(self._host, {})
-        if not host_data.get("online", False):
+        port_data = self.coordinator.data.get("ports", {}).get(self._port, {})
+        if not port_data.get("online", False):
             return False
         
         # Check if this specific bulb is connected
-        bulbs = host_data.get("bulbs", [])
+        bulbs = port_data.get("bulbs", [])
         for bulb in bulbs:
             if bulb.get("name") == self._bulb_name:
                 return bulb.get("connected", True)
@@ -149,8 +148,8 @@ class ESP32BulbRelayLight(CoordinatorEntity[ESP32BulbRelayCoordinator], LightEnt
         if self.coordinator.data is None:
             return
         
-        host_data = self.coordinator.data.get("hosts", {}).get(self._host, {})
-        bulbs = host_data.get("bulbs", [])
+        port_data = self.coordinator.data.get("ports", {}).get(self._port, {})
+        bulbs = port_data.get("bulbs", [])
         
         # Find this bulb in the data by name
         for bulb in bulbs:
@@ -160,7 +159,7 @@ class ESP32BulbRelayLight(CoordinatorEntity[ESP32BulbRelayCoordinator], LightEnt
                     "bulb_id": bulb.get("id"),
                     "address": bulb.get("address"),
                     "connected": bulb.get("connected", False),
-                    "esp32_host": self._host,
+                    "serial_port": self._port,
                 }
                 break
         
