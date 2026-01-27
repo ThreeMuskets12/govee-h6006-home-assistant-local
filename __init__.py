@@ -9,15 +9,14 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.helpers import aiohttp_client
 import homeassistant.helpers.config_validation as cv
 
-from .api import ESP32BulbRelayApi
+from .api import ESP32BulbRelaySerialApi
 from .const import (
     ATTR_BULB_NAME,
-    ATTR_ESP32_HOST,
+    ATTR_SERIAL_PORT,
     CONF_BULBS,
-    CONF_ESP32_HOSTS,
+    CONF_SERIAL_PORTS,
     DOMAIN,
     SERVICE_CONNECT_BULB,
     SERVICE_DISCONNECT_BULB,
@@ -32,7 +31,7 @@ PLATFORMS: list[Platform] = [Platform.LIGHT]
 # Service schemas
 SERVICE_CONNECT_DISCONNECT_SCHEMA = vol.Schema(
     {
-        vol.Required(ATTR_ESP32_HOST): cv.string,
+        vol.Required(ATTR_SERIAL_PORT): cv.string,
         vol.Required(ATTR_BULB_NAME): cv.string,
     }
 )
@@ -44,22 +43,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up ESP32 Bulb Relay from a config entry."""
     hass.data.setdefault(DOMAIN, {})
     
-    # Get ESP32 hosts from config
-    esp32_hosts = entry.data.get(CONF_ESP32_HOSTS, [])
+    # Get serial ports from config
+    serial_ports = entry.data.get(CONF_SERIAL_PORTS, [])
     
     # Create coordinator
-    coordinator = ESP32BulbRelayCoordinator(hass, esp32_hosts)
+    coordinator = ESP32BulbRelayCoordinator(hass, serial_ports)
     
-    # Initialize APIs for each host
-    session = aiohttp_client.async_get_clientsession(hass)
-    for host in esp32_hosts:
-        api = ESP32BulbRelayApi(host, session=session)
-        coordinator._apis[host] = api
+    # Initialize APIs for each port
+    for port in serial_ports:
+        api = ESP32BulbRelaySerialApi(port)
+        coordinator._apis[port] = api
+        
+        # Connect to ESP32
+        try:
+            await api.connect()
+        except Exception as err:
+            _LOGGER.warning("Failed to connect to %s: %s", port, err)
         
         # Set enabled bulbs from options
         bulb_config = entry.options.get(CONF_BULBS, {})
-        enabled_bulbs = set(bulb_config.get(host, []))
-        coordinator.set_enabled_bulbs(host, enabled_bulbs)
+        enabled_bulbs = set(bulb_config.get(port, []))
+        coordinator.set_enabled_bulbs(port, enabled_bulbs)
     
     # Fetch initial data
     await coordinator.async_config_entry_first_refresh()
@@ -81,7 +85,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     
     if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
+        coordinator: ESP32BulbRelayCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
+        await coordinator.async_shutdown()
     
     # Remove services if no more entries
     if not hass.data[DOMAIN]:
@@ -95,43 +100,43 @@ async def _async_setup_services(hass: HomeAssistant) -> None:
     
     async def handle_connect_bulb(call: ServiceCall) -> None:
         """Handle connect bulb service call."""
-        host = call.data[ATTR_ESP32_HOST]
+        port = call.data[ATTR_SERIAL_PORT]
         bulb_name = call.data[ATTR_BULB_NAME]
         
-        _LOGGER.info("Debug: Connecting bulb %s on %s", bulb_name, host)
+        _LOGGER.info("Debug: Connecting bulb %s on %s", bulb_name, port)
         
         for entry_id, coordinator in hass.data[DOMAIN].items():
             if isinstance(coordinator, ESP32BulbRelayCoordinator):
-                if host in coordinator.esp32_hosts:
+                if port in coordinator.serial_ports:
                     try:
-                        await coordinator.async_connect_bulb(host, bulb_name)
+                        await coordinator.async_connect_bulb(port, bulb_name)
                         _LOGGER.info("Successfully connected bulb %s", bulb_name)
                         return
                     except Exception as err:
                         _LOGGER.error("Failed to connect bulb %s: %s", bulb_name, err)
                         raise
         
-        _LOGGER.error("ESP32 host %s not found", host)
+        _LOGGER.error("Serial port %s not found", port)
 
     async def handle_disconnect_bulb(call: ServiceCall) -> None:
         """Handle disconnect bulb service call."""
-        host = call.data[ATTR_ESP32_HOST]
+        port = call.data[ATTR_SERIAL_PORT]
         bulb_name = call.data[ATTR_BULB_NAME]
         
-        _LOGGER.info("Debug: Disconnecting bulb %s on %s", bulb_name, host)
+        _LOGGER.info("Debug: Disconnecting bulb %s on %s", bulb_name, port)
         
         for entry_id, coordinator in hass.data[DOMAIN].items():
             if isinstance(coordinator, ESP32BulbRelayCoordinator):
-                if host in coordinator.esp32_hosts:
+                if port in coordinator.serial_ports:
                     try:
-                        await coordinator.async_disconnect_bulb(host, bulb_name)
+                        await coordinator.async_disconnect_bulb(port, bulb_name)
                         _LOGGER.info("Successfully disconnected bulb %s", bulb_name)
                         return
                     except Exception as err:
                         _LOGGER.error("Failed to disconnect bulb %s: %s", bulb_name, err)
                         raise
         
-        _LOGGER.error("ESP32 host %s not found", host)
+        _LOGGER.error("Serial port %s not found", port)
 
     async def handle_refresh_bulbs(call: ServiceCall) -> None:
         """Handle refresh bulbs service call."""

@@ -4,9 +4,9 @@
     "step": {
       "user": {
         "title": "Add ESP32 Bulb Relay",
-        "description": "Enter the IP address of your ESP32 Bulb Relay device (e.g., 192.168.1.100). The device must be connected to your network and accessible.",
+        "description": "Select the serial port where your ESP32 Bulb Relay device is connected.",
         "data": {
-          "esp32_host": "ESP32 IP Address"
+          "serial_port": "Serial Port"
         }
       },
       "select_bulbs": {
@@ -18,13 +18,14 @@
       }
     },
     "error": {
-      "cannot_connect": "Cannot connect to ESP32. Please check the IP address and ensure the device is online.",
+      "cannot_connect": "Cannot connect to ESP32. Please check the serial port and ensure the device is connected.",
       "no_bulbs": "No bulbs found on this ESP32. Please ensure bulbs are connected.",
       "no_bulbs_selected": "Please select at least one bulb to add.",
       "unknown": "An unexpected error occurred."
     },
     "abort": {
-      "already_configured": "This ESP32 is already configured."
+      "already_configured": "This serial port is already configured.",
+      "no_serial_ports": "No serial ports detected. Please connect your ESP32 device."
     }
   },
   "options": {
@@ -41,17 +42,17 @@
       },
       "manage_bulbs": {
         "title": "Manage Bulbs",
-        "description": "Select which bulbs should be enabled in Home Assistant. Configured hosts: {hosts}"
+        "description": "Select which bulbs should be enabled in Home Assistant. Configured ports: {ports}"
       },
       "add_esp32": {
         "title": "Add ESP32",
         "description": "Add another ESP32 Bulb Relay device to this integration.",
         "data": {
-          "esp32_host": "ESP32 IP Address"
+          "serial_port": "Serial Port"
         }
       },
       "select_new_bulbs": {
-        "title": "Select Bulbs from {host}",
+        "title": "Select Bulbs from {port}",
         "description": "Found {count} bulb(s) on this ESP32. Select which ones to add.",
         "data": {
           "bulbs": "Bulbs to Add"
@@ -61,7 +62,7 @@
         "title": "Remove ESP32",
         "description": "Select an ESP32 to remove from this integration. This will remove all bulbs associated with it.",
         "data": {
-          "host_to_remove": "ESP32 to Remove"
+          "port_to_remove": "ESP32 to Remove"
         }
       },
       "debug_commands": {
@@ -89,14 +90,15 @@
     },
     "error": {
       "cannot_connect": "Cannot connect to ESP32.",
-      "already_configured": "This ESP32 is already configured.",
+      "already_configured": "This serial port is already configured.",
       "no_bulbs": "No bulbs found on this ESP32.",
       "command_failed": "The command failed. Please check the connection."
     },
     "abort": {
-      "no_hosts": "No ESP32 hosts configured.",
+      "no_ports": "No ESP32 ports configured.",
       "cannot_remove_last": "Cannot remove the last ESP32. Delete the integration instead.",
-      "no_bulbs": "No bulbs available."
+      "no_bulbs": "No bulbs available.",
+      "no_new_serial_ports": "No new serial ports available. All detected ports are already configured."
     }
   },
   "services": {
@@ -104,9 +106,9 @@
       "name": "Connect Bulb",
       "description": "Reconnect a disconnected bulb (debug command).",
       "fields": {
-        "esp32_host": {
-          "name": "ESP32 Host",
-          "description": "IP address of the ESP32."
+        "serial_port": {
+          "name": "Serial Port",
+          "description": "Serial port of the ESP32."
         },
         "bulb_name": {
           "name": "Bulb Name",
@@ -118,9 +120,9 @@
       "name": "Disconnect Bulb",
       "description": "Disconnect a bulb (debug command).",
       "fields": {
-        "esp32_host": {
-          "name": "ESP32 Host",
-          "description": "IP address of the ESP32."
+        "serial_port": {
+          "name": "Serial Port",
+          "description": "Serial port of the ESP32."
         },
         "bulb_name": {
           "name": "Bulb Name",

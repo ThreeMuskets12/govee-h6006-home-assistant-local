@@ -2,11 +2,11 @@ connect_bulb:
   name: Connect Bulb
   description: Reconnect a disconnected bulb. This is a debug command and should only be used when troubleshooting.
   fields:
-    esp32_host:
-      name: ESP32 Host
-      description: The IP address of the ESP32 that the bulb is connected to.
+    serial_port:
+      name: Serial Port
+      description: The serial port of the ESP32 that the bulb is connected to.
       required: true
-      example: "192.168.1.100"
+      example: "/dev/ttyUSB0"
       selector:
         text:
     bulb_name:
@@ -21,11 +21,11 @@ disconnect_bulb:
   name: Disconnect Bulb
   description: Disconnect a bulb from the ESP32. This is a debug command. WARNING - The bulb will not respond to commands until reconnected.
   fields:
-    esp32_host:
-      name: ESP32 Host
-      description: The IP address of the ESP32 that the bulb is connected to.
+    serial_port:
+      name: Serial Port
+      description: The serial port of the ESP32 that the bulb is connected to.
       required: true
-      example: "192.168.1.100"
+      example: "/dev/ttyUSB0"
       selector:
         text:
     bulb_name:

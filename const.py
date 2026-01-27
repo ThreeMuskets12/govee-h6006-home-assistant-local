@@ -3,23 +3,23 @@
 DOMAIN = "esp32_bulb_relay"
 
 # Configuration keys
-CONF_ESP32_HOST = "esp32_host"
+CONF_SERIAL_PORT = "serial_port"
 CONF_BULBS = "bulbs"
-CONF_ESP32_HOSTS = "esp32_hosts"
+CONF_SERIAL_PORTS = "serial_ports"
 
 # Default values
-DEFAULT_PORT = 80
-DEFAULT_TIMEOUT = 10
+DEFAULT_BAUD_RATE = 115200
+DEFAULT_TIMEOUT = 30  # Seconds - ESP32 may take several seconds to respond
 
-# API Endpoints
-API_BULBS = "/bulbs"
-API_BULB_ON = "/bulb/{name}/on"
-API_BULB_OFF = "/bulb/{name}/off"
-API_BULB_BRIGHTNESS = "/bulb/{name}/brightness/{value}"
-API_BULB_RGB = "/bulb/{name}/rgb/r={r}&g={g}&b={b}"
-API_BULB_TEMPERATURE = "/bulb/{name}/temperature/{value}"
-API_BULB_CONNECT = "/bulb/{name}/connect"
-API_BULB_DISCONNECT = "/bulb/{name}/disconnect"
+# API Commands (same as HTTP endpoints, without the leading slash for serial)
+CMD_BULBS = "/bulbs"
+CMD_BULB_ON = "/bulb/{name}/on"
+CMD_BULB_OFF = "/bulb/{name}/off"
+CMD_BULB_BRIGHTNESS = "/bulb/{name}/brightness/{value}"
+CMD_BULB_RGB = "/bulb/{name}/rgb/r={r}&g={g}&b={b}"
+CMD_BULB_TEMPERATURE = "/bulb/{name}/temperature/{value}"
+CMD_BULB_CONNECT = "/bulb/{name}/connect"
+CMD_BULB_DISCONNECT = "/bulb/{name}/disconnect"
 
 # Color temperature range (in Kelvin)
 MIN_COLOR_TEMP_KELVIN = 2000
@@ -41,5 +41,5 @@ SERVICE_DISCONNECT_BULB = "disconnect_bulb"
 SERVICE_REFRESH_BULBS = "refresh_bulbs"
 
 # Attributes
-ATTR_ESP32_HOST = "esp32_host"
+ATTR_SERIAL_PORT = "serial_port"
 ATTR_BULB_NAME = "bulb_name"

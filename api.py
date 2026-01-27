@@ -1,22 +1,23 @@
-"""API client for ESP32 Bulb Relay."""
+"""Serial API client for ESP32 Bulb Relay."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
-import aiohttp
+import serial_asyncio
 
 from .const import (
-    API_BULB_BRIGHTNESS,
-    API_BULB_CONNECT,
-    API_BULB_DISCONNECT,
-    API_BULB_OFF,
-    API_BULB_ON,
-    API_BULB_RGB,
-    API_BULB_TEMPERATURE,
-    API_BULBS,
-    DEFAULT_PORT,
+    CMD_BULB_BRIGHTNESS,
+    CMD_BULB_CONNECT,
+    CMD_BULB_DISCONNECT,
+    CMD_BULB_OFF,
+    CMD_BULB_ON,
+    CMD_BULB_RGB,
+    CMD_BULB_TEMPERATURE,
+    CMD_BULBS,
+    DEFAULT_BAUD_RATE,
     DEFAULT_TIMEOUT,
 )
 from .queue import CommandQueue
@@ -36,70 +37,135 @@ class ESP32BulbRelayCommandError(ESP32BulbRelayApiError):
     """Exception for command failures."""
 
 
-class ESP32BulbRelayApi:
-    """API client for ESP32 Bulb Relay."""
+class ESP32BulbRelaySerialApi:
+    """Serial API client for ESP32 Bulb Relay."""
 
     def __init__(
         self,
-        host: str,
-        port: int = DEFAULT_PORT,
-        session: aiohttp.ClientSession | None = None,
+        port: str,
+        baud_rate: int = DEFAULT_BAUD_RATE,
         timeout: int = DEFAULT_TIMEOUT,
     ) -> None:
-        """Initialize the API client."""
-        self._host = host
+        """Initialize the serial API client."""
         self._port = port
-        self._session = session
+        self._baud_rate = baud_rate
         self._timeout = timeout
-        self._base_url = f"http://{host}:{port}"
-        self._owns_session = False
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._lock = asyncio.Lock()
         self._command_queue = CommandQueue()
+        self._connected = False
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create the aiohttp session."""
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-            self._owns_session = True
-        return self._session
+    async def connect(self) -> None:
+        """Establish serial connection."""
+        if self._connected:
+            return
+        
+        try:
+            self._reader, self._writer = await serial_asyncio.open_serial_connection(
+                url=self._port,
+                baudrate=self._baud_rate,
+            )
+            self._connected = True
+            _LOGGER.info("Connected to ESP32 on %s", self._port)
+            
+            # Give ESP32 time to reset after connection
+            await asyncio.sleep(2)
+            
+            # Clear any startup messages from buffer
+            await self._clear_buffer()
+            
+        except Exception as err:
+            self._connected = False
+            raise ESP32BulbRelayConnectionError(
+                f"Failed to connect to {self._port}: {err}"
+            ) from err
+
+    async def _clear_buffer(self) -> None:
+        """Clear any pending data in the read buffer."""
+        if self._reader is None:
+            return
+        try:
+            # Read with short timeout to clear buffer
+            while True:
+                try:
+                    async with asyncio.timeout(0.1):
+                        await self._reader.readline()
+                except asyncio.TimeoutError:
+                    break
+        except Exception:
+            pass
 
     async def close(self) -> None:
-        """Close the session and stop the queue."""
+        """Close the serial connection."""
         await self._command_queue.stop()
-        if self._owns_session and self._session:
-            await self._session.close()
-            self._session = None
+        
+        if self._writer:
+            try:
+                self._writer.close()
+                await self._writer.wait_closed()
+            except Exception:
+                pass
+        
+        self._reader = None
+        self._writer = None
+        self._connected = False
+        _LOGGER.info("Disconnected from ESP32 on %s", self._port)
 
-    async def _request(self, endpoint: str) -> dict[str, Any]:
-        """Make a request to the ESP32 and return JSON response."""
-        session = await self._get_session()
-        url = f"{self._base_url}{endpoint}"
+    async def _send_command(self, command: str) -> dict[str, Any]:
+        """Send a command and wait for JSON response."""
+        if not self._connected:
+            await self.connect()
+        
+        if self._writer is None or self._reader is None:
+            raise ESP32BulbRelayConnectionError("Not connected to ESP32")
+        
+        async with self._lock:
+            try:
+                # Clear any pending data
+                await self._clear_buffer()
+                
+                # Send command with newline
+                cmd_bytes = f"{command}\n".encode('utf-8')
+                self._writer.write(cmd_bytes)
+                await self._writer.drain()
+                _LOGGER.debug("Sent command: %s", command)
+                
+                # Read response with timeout
+                async with asyncio.timeout(self._timeout):
+                    # Read lines until we get valid JSON
+                    while True:
+                        line = await self._reader.readline()
+                        line_str = line.decode('utf-8').strip()
+                        
+                        if not line_str:
+                            continue
+                        
+                        _LOGGER.debug("Received: %s", line_str)
+                        
+                        # Try to parse as JSON
+                        try:
+                            result = json.loads(line_str)
+                            return result
+                        except json.JSONDecodeError:
+                            # Not JSON, might be debug output - keep reading
+                            _LOGGER.debug("Skipping non-JSON line: %s", line_str)
+                            continue
+                            
+            except asyncio.TimeoutError as err:
+                raise ESP32BulbRelayConnectionError(
+                    f"Timeout waiting for response from {self._port}"
+                ) from err
+            except Exception as err:
+                self._connected = False
+                raise ESP32BulbRelayApiError(
+                    f"Error communicating with ESP32: {err}"
+                ) from err
 
-        try:
-            async with asyncio.timeout(self._timeout):
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        raise ESP32BulbRelayApiError(
-                            f"API request failed with status {response.status}"
-                        )
-                    
-                    return await response.json()
-        except asyncio.TimeoutError as err:
-            raise ESP32BulbRelayConnectionError(
-                f"Timeout connecting to {self._host}"
-            ) from err
-        except aiohttp.ClientError as err:
-            raise ESP32BulbRelayConnectionError(
-                f"Error connecting to {self._host}: {err}"
-            ) from err
-        except Exception as err:
-            raise ESP32BulbRelayApiError(
-                f"Error parsing response from {self._host}: {err}"
-            ) from err
-
-    async def _queued_request(self, endpoint: str) -> dict[str, Any]:
-        """Make a rate-limited request through the command queue."""
+    async def _queued_command(self, command: str) -> dict[str, Any]:
+        """Send a rate-limited command through the queue."""
         return await self._command_queue.enqueue(
-            lambda: self._request(endpoint)
+            lambda: self._send_command(command)
         )
 
     def _check_success(self, result: dict[str, Any], action: str) -> None:
@@ -110,9 +176,14 @@ class ESP32BulbRelayApi:
             )
 
     @property
-    def host(self) -> str:
-        """Return the host."""
-        return self._host
+    def port(self) -> str:
+        """Return the serial port."""
+        return self._port
+
+    @property
+    def is_connected(self) -> bool:
+        """Return connection status."""
+        return self._connected
 
     @property
     def pending_commands(self) -> int:
@@ -134,7 +205,7 @@ class ESP32BulbRelayApi:
         
         Note: This is NOT rate-limited as it's used for status polling.
         """
-        result = await self._request(API_BULBS)
+        result = await self._send_command(CMD_BULBS)
         
         if isinstance(result, dict) and "bulbs" in result:
             return result["bulbs"]
@@ -146,8 +217,8 @@ class ESP32BulbRelayApi:
         
         Expected response: {"success": true, "bulb": "lamp", "action": "on"}
         """
-        endpoint = API_BULB_ON.format(name=bulb_name)
-        result = await self._queued_request(endpoint)
+        command = CMD_BULB_ON.format(name=bulb_name)
+        result = await self._queued_command(command)
         self._check_success(result, "on")
         return result
 
@@ -156,8 +227,8 @@ class ESP32BulbRelayApi:
         
         Expected response: {"success": true, "bulb": "lamp", "action": "off"}
         """
-        endpoint = API_BULB_OFF.format(name=bulb_name)
-        result = await self._queued_request(endpoint)
+        command = CMD_BULB_OFF.format(name=bulb_name)
+        result = await self._queued_command(command)
         self._check_success(result, "off")
         return result
 
@@ -167,8 +238,8 @@ class ESP32BulbRelayApi:
         Expected response: {"success": true, "bulb": "lamp", "action": "brightness", "value": VALUE}
         """
         brightness = max(0, min(100, brightness))
-        endpoint = API_BULB_BRIGHTNESS.format(name=bulb_name, value=brightness)
-        result = await self._queued_request(endpoint)
+        command = CMD_BULB_BRIGHTNESS.format(name=bulb_name, value=brightness)
+        result = await self._queued_command(command)
         self._check_success(result, "brightness")
         return result
 
@@ -180,8 +251,8 @@ class ESP32BulbRelayApi:
         r = max(0, min(255, r))
         g = max(0, min(255, g))
         b = max(0, min(255, b))
-        endpoint = API_BULB_RGB.format(name=bulb_name, r=r, g=g, b=b)
-        result = await self._queued_request(endpoint)
+        command = CMD_BULB_RGB.format(name=bulb_name, r=r, g=g, b=b)
+        result = await self._queued_command(command)
         self._check_success(result, "rgb")
         return result
 
@@ -191,28 +262,28 @@ class ESP32BulbRelayApi:
         Expected response: {"success": true, "bulb": "lamp", "action": "temperature", "value": VALUE}
         """
         temperature = max(2000, min(9000, temperature))
-        endpoint = API_BULB_TEMPERATURE.format(name=bulb_name, value=temperature)
-        result = await self._queued_request(endpoint)
+        command = CMD_BULB_TEMPERATURE.format(name=bulb_name, value=temperature)
+        result = await self._queued_command(command)
         self._check_success(result, "temperature")
         return result
 
-    async def connect(self, bulb_name: str) -> dict[str, Any]:
+    async def connect_bulb(self, bulb_name: str) -> dict[str, Any]:
         """Connect/reconnect a bulb (debug only).
         
         Expected response: {"success": true, "bulb": "lamp", "action": "connect"}
         """
-        endpoint = API_BULB_CONNECT.format(name=bulb_name)
-        result = await self._queued_request(endpoint)
+        command = CMD_BULB_CONNECT.format(name=bulb_name)
+        result = await self._queued_command(command)
         self._check_success(result, "connect")
         return result
 
-    async def disconnect(self, bulb_name: str) -> dict[str, Any]:
+    async def disconnect_bulb(self, bulb_name: str) -> dict[str, Any]:
         """Disconnect a bulb (debug only).
         
         Expected response: {"success": true, "bulb": "lamp", "action": "disconnect"}
         """
-        endpoint = API_BULB_DISCONNECT.format(name=bulb_name)
-        result = await self._queued_request(endpoint)
+        command = CMD_BULB_DISCONNECT.format(name=bulb_name)
+        result = await self._queued_command(command)
         self._check_success(result, "disconnect")
         return result
 
@@ -223,3 +294,19 @@ class ESP32BulbRelayApi:
             return True
         except ESP32BulbRelayApiError:
             return False
+
+
+async def list_serial_ports() -> list[dict[str, str]]:
+    """List available serial ports."""
+    import serial.tools.list_ports
+    
+    ports = []
+    for port in serial.tools.list_ports.comports():
+        ports.append({
+            "device": port.device,
+            "description": port.description,
+            "hwid": port.hwid,
+            "name": f"{port.device} - {port.description}" if port.description else port.device,
+        })
+    
+    return ports
