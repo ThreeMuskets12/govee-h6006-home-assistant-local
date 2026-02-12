@@ -40,6 +40,8 @@ async def async_setup_entry(
     # Get enabled bulbs (flat list)
     enabled_bulbs = config_entry.options.get(CONF_BULBS, [])
     
+    _LOGGER.info("Setting up %d light entities: %s", len(enabled_bulbs), enabled_bulbs)
+    
     entities: list[ESP32BulbRelayLight] = []
     
     for bulb_name in enabled_bulbs:
@@ -94,45 +96,95 @@ class ESP32BulbRelayLight(CoordinatorEntity[ESP32BulbRelayCoordinator], LightEnt
         self._attr_color_temp_kelvin = 4000
         self._attr_color_mode = ColorMode.COLOR_TEMP
         self._attr_available = True
+        
+        _LOGGER.debug("Created light entity for bulb '%s'", bulb_name)
 
     @property
     def available(self) -> bool:
-        """Return if entity is available."""
+        """Return if entity is available.
+        
+        A bulb is available if:
+        1. The coordinator has successfully updated at least once
+        2. The bulb was found in the data
+        3. The bulb's 'connected' field is True
+        
+        Note: We intentionally do NOT check port_online here, because the bulb
+        data itself already contains the connected status. A port being "offline"
+        just means we couldn't query it, but if we have cached data showing the
+        bulb is connected, we should still allow commands (they might work).
+        """
+        # Check if coordinator has ever succeeded
         if not self.coordinator.last_update_success:
+            _LOGGER.debug(
+                "Bulb '%s' unavailable: coordinator.last_update_success=False",
+                self._bulb_name
+            )
             return False
         
         if self.coordinator.data is None:
+            _LOGGER.debug(
+                "Bulb '%s' unavailable: coordinator.data is None",
+                self._bulb_name
+            )
             return False
         
-        # Check if bulb is found on any port
-        bulb_data = self.coordinator.data.get("bulbs", {}).get(self._bulb_name)
+        # Check if bulb is in the data
+        bulbs_data = self.coordinator.data.get("bulbs", {})
+        bulb_data = bulbs_data.get(self._bulb_name)
+        
         if bulb_data is None:
+            _LOGGER.debug(
+                "Bulb '%s' unavailable: not found in coordinator.data['bulbs']. "
+                "Available bulbs: %s",
+                self._bulb_name,
+                list(bulbs_data.keys())
+            )
             return False
         
-        # Check if the port it's on is online
-        if not bulb_data.get("port_online", False):
-            return False
+        # Check the bulb's connected status from ESP32
+        is_connected = bulb_data.get("connected", False)
+        current_port = bulb_data.get("current_port", "unknown")
         
-        # Check if the bulb itself is connected
-        return bulb_data.get("connected", True)
+        if not is_connected:
+            _LOGGER.debug(
+                "Bulb '%s' unavailable: connected=False (port=%s)",
+                self._bulb_name,
+                current_port
+            )
+        
+        return is_connected
 
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
         if self.coordinator.data is None:
+            _LOGGER.debug("Coordinator update for '%s': data is None", self._bulb_name)
             return
         
         bulb_data = self.coordinator.data.get("bulbs", {}).get(self._bulb_name)
         
         if bulb_data:
             current_port = bulb_data.get("current_port", "unknown")
+            is_connected = bulb_data.get("connected", False)
+            
+            _LOGGER.debug(
+                "Coordinator update for '%s': connected=%s, port=%s",
+                self._bulb_name,
+                is_connected,
+                current_port
+            )
+            
             self._attr_extra_state_attributes = {
                 "bulb_id": bulb_data.get("id"),
                 "address": bulb_data.get("address"),
-                "connected": bulb_data.get("connected", False),
+                "connected": is_connected,
                 "current_port": current_port,
             }
         else:
+            _LOGGER.debug(
+                "Coordinator update for '%s': bulb not found in data",
+                self._bulb_name
+            )
             self._attr_extra_state_attributes = {
                 "connected": False,
                 "current_port": "not found",
@@ -142,10 +194,13 @@ class ESP32BulbRelayLight(CoordinatorEntity[ESP32BulbRelayCoordinator], LightEnt
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the light on."""
+        _LOGGER.debug("async_turn_on called for '%s' with kwargs: %s", self._bulb_name, kwargs)
+        
         try:
             # Handle RGB color
             if ATTR_RGB_COLOR in kwargs:
                 r, g, b = kwargs[ATTR_RGB_COLOR]
+                _LOGGER.debug("Setting RGB for '%s': r=%d, g=%d, b=%d", self._bulb_name, r, g, b)
                 await self.coordinator.async_send_command(
                     self._bulb_name, "set_rgb", r, g, b
                 )
@@ -155,6 +210,7 @@ class ESP32BulbRelayLight(CoordinatorEntity[ESP32BulbRelayCoordinator], LightEnt
             # Handle color temperature
             elif ATTR_COLOR_TEMP_KELVIN in kwargs:
                 temp = kwargs[ATTR_COLOR_TEMP_KELVIN]
+                _LOGGER.debug("Setting temperature for '%s': %dK", self._bulb_name, temp)
                 await self.coordinator.async_send_command(
                     self._bulb_name, "set_temperature", temp
                 )
@@ -165,6 +221,7 @@ class ESP32BulbRelayLight(CoordinatorEntity[ESP32BulbRelayCoordinator], LightEnt
             if ATTR_BRIGHTNESS in kwargs:
                 # Convert 0-255 to 0-100
                 brightness_pct = int(kwargs[ATTR_BRIGHTNESS] * 100 / 255)
+                _LOGGER.debug("Setting brightness for '%s': %d%%", self._bulb_name, brightness_pct)
                 await self.coordinator.async_send_command(
                     self._bulb_name, "set_brightness", brightness_pct
                 )
@@ -172,28 +229,34 @@ class ESP32BulbRelayLight(CoordinatorEntity[ESP32BulbRelayCoordinator], LightEnt
             
             # Turn on if not already adjusting other properties
             if not any(k in kwargs for k in [ATTR_RGB_COLOR, ATTR_COLOR_TEMP_KELVIN, ATTR_BRIGHTNESS]):
+                _LOGGER.debug("Sending turn_on for '%s'", self._bulb_name)
                 await self.coordinator.async_send_command(
                     self._bulb_name, "turn_on"
                 )
             elif ATTR_RGB_COLOR not in kwargs and ATTR_COLOR_TEMP_KELVIN not in kwargs:
                 # If only brightness was set, also turn on
+                _LOGGER.debug("Sending turn_on for '%s' (brightness only)", self._bulb_name)
                 await self.coordinator.async_send_command(
                     self._bulb_name, "turn_on"
                 )
             
             self._attr_is_on = True
             self.async_write_ha_state()
+            _LOGGER.info("Successfully turned on '%s'", self._bulb_name)
             
         except ESP32BulbRelayApiError as err:
-            _LOGGER.error("Failed to turn on %s: %s", self._bulb_name, err)
+            _LOGGER.error("Failed to turn on '%s': %s", self._bulb_name, err)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the light off."""
+        _LOGGER.debug("async_turn_off called for '%s'", self._bulb_name)
+        
         try:
             await self.coordinator.async_send_command(
                 self._bulb_name, "turn_off"
             )
             self._attr_is_on = False
             self.async_write_ha_state()
+            _LOGGER.info("Successfully turned off '%s'", self._bulb_name)
         except ESP32BulbRelayApiError as err:
-            _LOGGER.error("Failed to turn off %s: %s", self._bulb_name, err)
+            _LOGGER.error("Failed to turn off '%s': %s", self._bulb_name, err)

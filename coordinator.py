@@ -105,7 +105,10 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         
         Returns list of bulb dicts: {"id": 0, "name": "lamp", "address": "...", "connected": true}
         """
+        _LOGGER.debug("Scanning port %s", port)
+        
         if port not in self._apis:
+            _LOGGER.debug("Creating new API client for port %s", port)
             api = ESP32BulbRelaySerialApi(port)
             self._apis[port] = api
         
@@ -113,10 +116,20 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         
         try:
             if not api.is_connected:
+                _LOGGER.debug("Connecting to port %s", port)
                 await api.connect()
             
+            _LOGGER.debug("Querying /bulbs on port %s", port)
             bulbs = await api.get_bulbs()
             self._port_online[port] = True
+            
+            _LOGGER.info(
+                "Port %s scan successful: %d bulbs found: %s",
+                port,
+                len(bulbs),
+                [(b.get("name"), b.get("connected")) for b in bulbs]
+            )
+            
             return bulbs
         except ESP32BulbRelayApiError as err:
             _LOGGER.warning("Failed to scan port %s: %s", port, err)
@@ -128,6 +141,8 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         
         Returns the new bulb->port mapping.
         """
+        _LOGGER.debug("Rescanning all %d ports: %s", len(self._serial_ports), self._serial_ports)
+        
         new_mapping: dict[str, str] = {}
         new_bulb_data: dict[str, dict[str, Any]] = {}
         
@@ -140,6 +155,12 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if bulb_name:
                         new_mapping[bulb_name] = port
                         new_bulb_data[bulb_name] = bulb
+                        _LOGGER.debug(
+                            "Found bulb '%s' on port %s (connected=%s)",
+                            bulb_name,
+                            port,
+                            bulb.get("connected")
+                        )
                         
             except Exception as err:
                 _LOGGER.error("Error scanning port %s: %s", port, err)
@@ -166,10 +187,17 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     bulb_name
                 )
         
+        _LOGGER.debug(
+            "Rescan complete: bulb_port_map=%s",
+            new_mapping
+        )
+        
         return new_mapping
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from all ESP32s and update bulb->port mapping."""
+        _LOGGER.debug("Starting coordinator data update")
+        
         # Rescan all ports to update mapping
         await self.async_rescan_all_ports()
         
@@ -181,18 +209,37 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         
         # Add port status
         for port in self._serial_ports:
+            online = self._port_online.get(port, False)
             data["ports"][port] = {
-                "online": self._port_online.get(port, False),
+                "online": online,
             }
+            _LOGGER.debug("Port %s: online=%s", port, online)
         
         # Add bulb data with current port info
         for bulb_name, bulb_info in self._bulb_data.items():
             port = self._bulb_port_map.get(bulb_name)
+            port_online = self._port_online.get(port, False) if port else False
+            is_connected = bulb_info.get("connected", False)
+            
             data["bulbs"][bulb_name] = {
                 **bulb_info,
                 "current_port": port,
-                "port_online": self._port_online.get(port, False) if port else False,
+                "port_online": port_online,
             }
+            
+            _LOGGER.debug(
+                "Bulb '%s': connected=%s, port=%s, port_online=%s",
+                bulb_name,
+                is_connected,
+                port,
+                port_online
+            )
+        
+        _LOGGER.debug(
+            "Coordinator update complete: %d ports, %d bulbs",
+            len(data["ports"]),
+            len(data["bulbs"])
+        )
         
         return data
 
