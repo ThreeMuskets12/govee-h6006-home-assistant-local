@@ -21,6 +21,9 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Shorter timeout for setup/test connections
+SETUP_TIMEOUT = 15
+
 
 class ESP32BulbRelayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for ESP32 Bulb Relay."""
@@ -32,6 +35,7 @@ class ESP32BulbRelayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._discovered_bulbs: list[dict[str, Any]] = []
         self._serial_port: str = ""
         self._available_ports: list[dict[str, str]] = []
+        _LOGGER.debug("Config flow initialized")
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -39,40 +43,61 @@ class ESP32BulbRelayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Handle the initial step - Select serial port."""
         errors: dict[str, str] = {}
 
+        _LOGGER.debug("async_step_user called with input: %s", user_input)
+
         # Get available serial ports
+        _LOGGER.debug("Listing serial ports...")
         self._available_ports = await list_serial_ports()
+        _LOGGER.info("Found %d serial ports: %s", 
+                    len(self._available_ports), 
+                    [p["device"] for p in self._available_ports])
         
         if not self._available_ports:
+            _LOGGER.warning("No serial ports found")
             return self.async_abort(reason="no_serial_ports")
 
         if user_input is not None:
             port = user_input[CONF_SERIAL_PORT]
             self._serial_port = port
+            _LOGGER.info("User selected port: %s", port)
 
             # Test connection and get bulbs
-            api = ESP32BulbRelaySerialApi(port)
+            api = ESP32BulbRelaySerialApi(port, timeout=SETUP_TIMEOUT)
 
             try:
+                _LOGGER.info("Attempting to connect to %s...", port)
                 await api.connect()
-                bulbs = await api.get_bulbs()
+                _LOGGER.info("Connected to %s, querying bulbs...", port)
+                
+                # Use shorter timeout for initial query
+                bulbs = await api.get_bulbs(timeout=SETUP_TIMEOUT)
+                _LOGGER.info("Got bulbs from %s: %s", port, bulbs)
+                
                 await api.close()
                 
                 if not bulbs:
+                    _LOGGER.warning("No bulbs found on %s", port)
                     errors["base"] = "no_bulbs"
                 else:
+                    _LOGGER.info("Found %d bulbs on %s", len(bulbs), port)
                     self._discovered_bulbs = bulbs
                     return await self.async_step_select_bulbs()
+                    
             except ESP32BulbRelayApiError as err:
-                _LOGGER.error("Connection error: %s", err)
+                _LOGGER.error("Connection error on %s: %s", port, err)
+                errors["base"] = "cannot_connect"
+            except Exception as err:
+                _LOGGER.exception("Unexpected error connecting to %s: %s", port, err)
                 errors["base"] = "cannot_connect"
             finally:
                 try:
                     await api.close()
-                except Exception:
-                    pass
+                except Exception as close_err:
+                    _LOGGER.debug("Error closing API: %s", close_err)
 
         # Build port selection options
         port_options = {p["device"]: p["name"] for p in self._available_ports}
+        _LOGGER.debug("Showing port selection form with options: %s", list(port_options.keys()))
 
         return self.async_show_form(
             step_id="user",
