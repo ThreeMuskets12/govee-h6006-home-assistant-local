@@ -86,7 +86,6 @@ class ESP32BulbRelaySerialApi:
         if self._reader is None:
             return
         try:
-            # Read with short timeout to clear buffer
             while True:
                 try:
                     async with asyncio.timeout(0.1):
@@ -129,11 +128,10 @@ class ESP32BulbRelaySerialApi:
                 cmd_bytes = f"{command}\n".encode('utf-8')
                 self._writer.write(cmd_bytes)
                 await self._writer.drain()
-                _LOGGER.debug("Sent command: %s", command)
+                _LOGGER.debug("Sent command to %s: %s", self._port, command)
                 
                 # Read response with timeout
                 async with asyncio.timeout(self._timeout):
-                    # Read lines until we get valid JSON
                     while True:
                         line = await self._reader.readline()
                         line_str = line.decode('utf-8').strip()
@@ -141,14 +139,13 @@ class ESP32BulbRelaySerialApi:
                         if not line_str:
                             continue
                         
-                        _LOGGER.debug("Received: %s", line_str)
+                        _LOGGER.debug("Received from %s: %s", self._port, line_str)
                         
                         # Try to parse as JSON
                         try:
                             result = json.loads(line_str)
                             return result
                         except json.JSONDecodeError:
-                            # Not JSON, might be debug output - keep reading
                             _LOGGER.debug("Skipping non-JSON line: %s", line_str)
                             continue
                             
@@ -213,30 +210,21 @@ class ESP32BulbRelaySerialApi:
         return []
 
     async def turn_on(self, bulb_name: str) -> dict[str, Any]:
-        """Turn on a bulb.
-        
-        Expected response: {"success": true, "bulb": "lamp", "action": "on"}
-        """
+        """Turn on a bulb."""
         command = CMD_BULB_ON.format(name=bulb_name)
         result = await self._queued_command(command)
         self._check_success(result, "on")
         return result
 
     async def turn_off(self, bulb_name: str) -> dict[str, Any]:
-        """Turn off a bulb.
-        
-        Expected response: {"success": true, "bulb": "lamp", "action": "off"}
-        """
+        """Turn off a bulb."""
         command = CMD_BULB_OFF.format(name=bulb_name)
         result = await self._queued_command(command)
         self._check_success(result, "off")
         return result
 
     async def set_brightness(self, bulb_name: str, brightness: int) -> dict[str, Any]:
-        """Set bulb brightness (0-100).
-        
-        Expected response: {"success": true, "bulb": "lamp", "action": "brightness", "value": VALUE}
-        """
+        """Set bulb brightness (0-100)."""
         brightness = max(0, min(100, brightness))
         command = CMD_BULB_BRIGHTNESS.format(name=bulb_name, value=brightness)
         result = await self._queued_command(command)
@@ -244,10 +232,7 @@ class ESP32BulbRelaySerialApi:
         return result
 
     async def set_rgb(self, bulb_name: str, r: int, g: int, b: int) -> dict[str, Any]:
-        """Set bulb RGB color (0-255 each).
-        
-        Expected response: {"success": true, "bulb": "lamp", "action": "rgb", "r": R, "g": G, "b": B}
-        """
+        """Set bulb RGB color (0-255 each)."""
         r = max(0, min(255, r))
         g = max(0, min(255, g))
         b = max(0, min(255, b))
@@ -257,10 +242,7 @@ class ESP32BulbRelaySerialApi:
         return result
 
     async def set_temperature(self, bulb_name: str, temperature: int) -> dict[str, Any]:
-        """Set bulb white temperature (2000-9000K).
-        
-        Expected response: {"success": true, "bulb": "lamp", "action": "temperature", "value": VALUE}
-        """
+        """Set bulb white temperature (2000-9000K)."""
         temperature = max(2000, min(9000, temperature))
         command = CMD_BULB_TEMPERATURE.format(name=bulb_name, value=temperature)
         result = await self._queued_command(command)
@@ -268,20 +250,14 @@ class ESP32BulbRelaySerialApi:
         return result
 
     async def connect_bulb(self, bulb_name: str) -> dict[str, Any]:
-        """Connect/reconnect a bulb (debug only).
-        
-        Expected response: {"success": true, "bulb": "lamp", "action": "connect"}
-        """
+        """Connect/reconnect a bulb (debug only)."""
         command = CMD_BULB_CONNECT.format(name=bulb_name)
         result = await self._queued_command(command)
         self._check_success(result, "connect")
         return result
 
     async def disconnect_bulb(self, bulb_name: str) -> dict[str, Any]:
-        """Disconnect a bulb (debug only).
-        
-        Expected response: {"success": true, "bulb": "lamp", "action": "disconnect"}
-        """
+        """Disconnect a bulb (debug only)."""
         command = CMD_BULB_DISCONNECT.format(name=bulb_name)
         result = await self._queued_command(command)
         self._check_success(result, "disconnect")
@@ -301,8 +277,6 @@ async def list_serial_ports() -> list[dict[str, str]]:
     
     This runs in an executor to avoid blocking the event loop.
     """
-    import asyncio
-    
     def _list_ports() -> list[dict[str, str]]:
         import serial.tools.list_ports
         

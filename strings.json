@@ -4,14 +4,14 @@
     "step": {
       "user": {
         "title": "Add ESP32 Bulb Relay",
-        "description": "Select the serial port where your ESP32 Bulb Relay device is connected.",
+        "description": "Select the serial port where your ESP32 Bulb Relay device is connected. You can add more ports later.",
         "data": {
           "serial_port": "Serial Port"
         }
       },
       "select_bulbs": {
         "title": "Select Bulbs",
-        "description": "Select which bulbs you want to add to Home Assistant. You can change this later in the integration settings.",
+        "description": "Select which bulbs you want to add to Home Assistant. Bulbs are identified by name and will be automatically found regardless of which port they're connected to.",
         "data": {
           "bulbs": "Bulbs to Add"
         }
@@ -19,12 +19,12 @@
     },
     "error": {
       "cannot_connect": "Cannot connect to ESP32. Please check the serial port and ensure the device is connected.",
-      "no_bulbs": "No bulbs found on this ESP32. Please ensure bulbs are connected.",
+      "no_bulbs": "No bulbs found on this ESP32. Please ensure bulbs are configured.",
       "no_bulbs_selected": "Please select at least one bulb to add.",
       "unknown": "An unexpected error occurred."
     },
     "abort": {
-      "already_configured": "This serial port is already configured.",
+      "already_configured": "ESP32 Bulb Relay is already configured.",
       "no_serial_ports": "No serial ports detected. Please connect your ESP32 device."
     }
   },
@@ -35,18 +35,22 @@
         "description": "Configure your ESP32 Bulb Relay integration.",
         "menu_options": {
           "manage_bulbs": "Manage Bulbs",
-          "add_esp32": "Add ESP32",
-          "remove_esp32": "Remove ESP32",
-          "debug_commands": "Debug Commands (Connect/Disconnect)"
+          "add_esp32": "Add ESP32 Port",
+          "remove_esp32": "Remove ESP32 Port",
+          "rescan_ports": "Rescan All Ports",
+          "debug_commands": "Debug Commands"
         }
       },
       "manage_bulbs": {
         "title": "Manage Bulbs",
-        "description": "Select which bulbs should be enabled in Home Assistant. Configured ports: {ports}"
+        "description": "Found {bulb_count} bulb(s) across {ports}. Select which bulbs to enable in Home Assistant.",
+        "data": {
+          "bulbs": "Enabled Bulbs"
+        }
       },
       "add_esp32": {
-        "title": "Add ESP32",
-        "description": "Add another ESP32 Bulb Relay device to this integration.",
+        "title": "Add ESP32 Port",
+        "description": "Add another ESP32 serial port to scan for bulbs.",
         "data": {
           "serial_port": "Serial Port"
         }
@@ -59,15 +63,15 @@
         }
       },
       "remove_esp32": {
-        "title": "Remove ESP32",
-        "description": "Select an ESP32 to remove from this integration. This will remove all bulbs associated with it.",
+        "title": "Remove ESP32 Port",
+        "description": "Remove a serial port from scanning. Note: Bulbs may still be found on other ports.",
         "data": {
-          "port_to_remove": "ESP32 to Remove"
+          "port_to_remove": "Port to Remove"
         }
       },
       "debug_commands": {
         "title": "Debug Commands",
-        "description": "These commands are for debugging purposes only. Use with caution.",
+        "description": "Advanced commands for troubleshooting.",
         "menu_options": {
           "debug_connect": "Connect Bulb",
           "debug_disconnect": "Disconnect Bulb"
@@ -75,14 +79,14 @@
       },
       "debug_connect": {
         "title": "Connect Bulb",
-        "description": "Manually connect/reconnect a bulb. This is a debug command.",
+        "description": "Manually connect/reconnect a bulb.",
         "data": {
           "bulb": "Bulb to Connect"
         }
       },
       "debug_disconnect": {
         "title": "Disconnect Bulb",
-        "description": "Manually disconnect a bulb. This is a debug command. WARNING: The bulb will not respond until reconnected.",
+        "description": "Manually disconnect a bulb. WARNING: The bulb will not respond until reconnected.",
         "data": {
           "bulb": "Bulb to Disconnect"
         }
@@ -92,13 +96,16 @@
       "cannot_connect": "Cannot connect to ESP32.",
       "already_configured": "This serial port is already configured.",
       "no_bulbs": "No bulbs found on this ESP32.",
-      "command_failed": "The command failed. Please check the connection."
+      "command_failed": "The command failed.",
+      "bulb_not_found": "Bulb not found on any port."
     },
     "abort": {
       "no_ports": "No ESP32 ports configured.",
-      "cannot_remove_last": "Cannot remove the last ESP32. Delete the integration instead.",
+      "cannot_remove_last": "Cannot remove the last port. Delete the integration instead.",
       "no_bulbs": "No bulbs available.",
-      "no_new_serial_ports": "No new serial ports available. All detected ports are already configured."
+      "no_bulbs_found": "No bulbs found on any configured port.",
+      "no_new_serial_ports": "No new serial ports available.",
+      "rescan_complete": "Rescan complete.\n\n{status}"
     }
   },
   "services": {
@@ -106,10 +113,6 @@
       "name": "Connect Bulb",
       "description": "Reconnect a disconnected bulb (debug command).",
       "fields": {
-        "serial_port": {
-          "name": "Serial Port",
-          "description": "Serial port of the ESP32."
-        },
         "bulb_name": {
           "name": "Bulb Name",
           "description": "Name of the bulb to connect."
@@ -120,10 +123,6 @@
       "name": "Disconnect Bulb",
       "description": "Disconnect a bulb (debug command).",
       "fields": {
-        "serial_port": {
-          "name": "Serial Port",
-          "description": "Serial port of the ESP32."
-        },
         "bulb_name": {
           "name": "Bulb Name",
           "description": "Name of the bulb to disconnect."
@@ -133,6 +132,10 @@
     "refresh_bulbs": {
       "name": "Refresh Bulbs",
       "description": "Force refresh the status of all bulbs."
+    },
+    "rescan_ports": {
+      "name": "Rescan Ports",
+      "description": "Rescan all configured serial ports to find bulbs. Use this if USB ports have changed."
     }
   }
 }

@@ -49,10 +49,6 @@ class ESP32BulbRelayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             port = user_input[CONF_SERIAL_PORT]
             self._serial_port = port
 
-            # Check if already configured
-            await self.async_set_unique_id(f"esp32_bulb_relay_{port.replace('/', '_')}")
-            self._abort_if_unique_id_configured()
-
             # Test connection and get bulbs
             api = ESP32BulbRelaySerialApi(port)
 
@@ -102,15 +98,19 @@ class ESP32BulbRelayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     errors={"base": "no_bulbs_selected"},
                 )
 
+            # Create unique ID based on first port (will scan all ports dynamically)
+            await self.async_set_unique_id(f"esp32_bulb_relay")
+            self._abort_if_unique_id_configured()
+
             return self.async_create_entry(
-                title=f"ESP32 Bulb Relay ({self._serial_port})",
+                title="ESP32 Bulb Relay",
                 data={
+                    # Store ports as a list to scan
                     CONF_SERIAL_PORTS: [self._serial_port],
                 },
                 options={
-                    CONF_BULBS: {
-                        self._serial_port: selected_bulbs,
-                    },
+                    # Store bulbs as flat list (not grouped by port)
+                    CONF_BULBS: selected_bulbs,
                 },
             )
 
@@ -120,13 +120,8 @@ class ESP32BulbRelayConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     def _get_bulb_selection_schema(self) -> vol.Schema:
-        """Get schema for bulb selection.
-        
-        Bulb format from API: {"id": 0, "name": "lamp", "address": "...", "connected": true}
-        """
+        """Get schema for bulb selection."""
         bulb_names = [bulb["name"] for bulb in self._discovered_bulbs if "name" in bulb]
-        
-        # Create dict for multi_select: {value: label}
         bulb_options = {name: name for name in bulb_names}
 
         return vol.Schema(
@@ -161,9 +156,10 @@ class ESP32BulbRelayOptionsFlow(config_entries.OptionsFlow):
             step_id="init",
             menu_options={
                 "manage_bulbs": "Manage Bulbs",
-                "add_esp32": "Add ESP32",
-                "remove_esp32": "Remove ESP32",
-                "debug_commands": "Debug Commands (Connect/Disconnect)",
+                "add_esp32": "Add ESP32 Port",
+                "remove_esp32": "Remove ESP32 Port",
+                "rescan_ports": "Rescan All Ports",
+                "debug_commands": "Debug Commands",
             },
         )
 
@@ -174,28 +170,21 @@ class ESP32BulbRelayOptionsFlow(config_entries.OptionsFlow):
         errors: dict[str, str] = {}
         
         ports = self._config_entry.data.get(CONF_SERIAL_PORTS, [])
-        current_bulbs = dict(self._config_entry.options.get(CONF_BULBS, {}))
+        current_bulbs = set(self._config_entry.options.get(CONF_BULBS, []))
         
         if user_input is not None:
-            # Update bulb selections for each port
-            new_bulbs = {}
-            for port in ports:
-                key = f"bulbs_{port.replace('/', '_').replace('.', '_')}"
-                if key in user_input:
-                    new_bulbs[port] = user_input[key]
-                else:
-                    new_bulbs[port] = current_bulbs.get(port, [])
+            selected_bulbs = user_input.get(CONF_BULBS, [])
             
             return self.async_create_entry(
                 title="",
                 data={
                     **self._config_entry.options,
-                    CONF_BULBS: new_bulbs,
+                    CONF_BULBS: selected_bulbs,
                 },
             )
 
-        # Build schema with bulbs for each port
-        schema_dict = {}
+        # Scan all ports to get available bulbs
+        all_bulbs: dict[str, str] = {}  # bulb_name -> port (for display)
         
         for port in ports:
             api = ESP32BulbRelaySerialApi(port)
@@ -204,34 +193,38 @@ class ESP32BulbRelayOptionsFlow(config_entries.OptionsFlow):
                 bulbs = await api.get_bulbs()
                 await api.close()
                 
-                bulb_names = [bulb["name"] for bulb in bulbs if "name" in bulb]
-                
-                current_selection = current_bulbs.get(port, bulb_names)
-                key = f"bulbs_{port.replace('/', '_').replace('.', '_')}"
-                
-                if bulb_names:
-                    bulb_options = {name: name for name in bulb_names}
-                    schema_dict[
-                        vol.Optional(key, default=current_selection)
-                    ] = cv.multi_select(bulb_options)
+                for bulb in bulbs:
+                    bulb_name = bulb.get("name")
+                    if bulb_name:
+                        all_bulbs[bulb_name] = port
             except ESP32BulbRelayApiError:
                 _LOGGER.warning("Could not connect to %s", port)
-                errors[f"bulbs_{port}"] = "cannot_connect"
             finally:
                 try:
                     await api.close()
                 except Exception:
                     pass
 
-        if not schema_dict:
-            return self.async_abort(reason="no_ports")
+        if not all_bulbs:
+            return self.async_abort(reason="no_bulbs_found")
+
+        # Create options with port info in label
+        bulb_options = {name: f"{name} ({port})" for name, port in all_bulbs.items()}
+        
+        # Default to currently enabled bulbs that still exist
+        default_selection = [b for b in current_bulbs if b in all_bulbs]
 
         return self.async_show_form(
             step_id="manage_bulbs",
-            data_schema=vol.Schema(schema_dict),
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_BULBS, default=default_selection): cv.multi_select(bulb_options),
+                }
+            ),
             errors=errors,
             description_placeholders={
                 "ports": ", ".join(ports),
+                "bulb_count": str(len(all_bulbs)),
             },
         )
 
@@ -303,11 +296,13 @@ class ESP32BulbRelayOptionsFlow(config_entries.OptionsFlow):
             existing_ports = list(self._config_entry.data.get(CONF_SERIAL_PORTS, []))
             existing_ports.append(self._port_to_add)
             
-            # Update options with new bulbs
-            current_bulbs = dict(self._config_entry.options.get(CONF_BULBS, {}))
-            current_bulbs[self._port_to_add] = selected_bulbs
+            # Add new bulbs to existing list
+            current_bulbs = list(self._config_entry.options.get(CONF_BULBS, []))
+            for bulb in selected_bulbs:
+                if bulb not in current_bulbs:
+                    current_bulbs.append(bulb)
 
-            # Update the config entry data
+            # Update the config entry data with new port
             self.hass.config_entries.async_update_entry(
                 self._config_entry,
                 data={
@@ -356,11 +351,8 @@ class ESP32BulbRelayOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             port_to_remove = user_input["port_to_remove"]
             
-            # Update config entry
+            # Update config entry - remove port
             ports.remove(port_to_remove)
-            current_bulbs = dict(self._config_entry.options.get(CONF_BULBS, {}))
-            if port_to_remove in current_bulbs:
-                del current_bulbs[port_to_remove]
 
             self.hass.config_entries.async_update_entry(
                 self._config_entry,
@@ -370,15 +362,11 @@ class ESP32BulbRelayOptionsFlow(config_entries.OptionsFlow):
                 },
             )
 
-            return self.async_create_entry(
-                title="",
-                data={
-                    **self._config_entry.options,
-                    CONF_BULBS: current_bulbs,
-                },
-            )
+            # Note: We don't remove bulbs - they might be on another port
+            # or the port might come back. The coordinator handles unavailable bulbs.
+            
+            return self.async_create_entry(title="", data=self._config_entry.options)
 
-        # Create friendly names for ports
         port_options = {port: port for port in ports}
 
         return self.async_show_form(
@@ -390,10 +378,66 @@ class ESP32BulbRelayOptionsFlow(config_entries.OptionsFlow):
             ),
         )
 
+    async def async_step_rescan_ports(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Rescan all ports to find bulbs."""
+        ports = self._config_entry.data.get(CONF_SERIAL_PORTS, [])
+        current_bulbs = set(self._config_entry.options.get(CONF_BULBS, []))
+        
+        # Scan all ports
+        found_bulbs: dict[str, str] = {}  # bulb_name -> port
+        port_status: dict[str, str] = {}  # port -> status
+        
+        for port in ports:
+            api = ESP32BulbRelaySerialApi(port)
+            try:
+                await api.connect()
+                bulbs = await api.get_bulbs()
+                await api.close()
+                
+                port_status[port] = f"Online ({len(bulbs)} bulbs)"
+                for bulb in bulbs:
+                    bulb_name = bulb.get("name")
+                    if bulb_name:
+                        found_bulbs[bulb_name] = port
+            except ESP32BulbRelayApiError as err:
+                port_status[port] = f"Offline: {err}"
+            finally:
+                try:
+                    await api.close()
+                except Exception:
+                    pass
+        
+        # Check which enabled bulbs were found
+        found_enabled = [b for b in current_bulbs if b in found_bulbs]
+        missing_enabled = [b for b in current_bulbs if b not in found_bulbs]
+        new_discovered = [b for b in found_bulbs if b not in current_bulbs]
+        
+        # Build status message
+        status_lines = ["**Port Status:**"]
+        for port, status in port_status.items():
+            status_lines.append(f"- {port}: {status}")
+        
+        status_lines.append("")
+        status_lines.append(f"**Enabled bulbs found:** {len(found_enabled)}")
+        if missing_enabled:
+            status_lines.append(f"**Missing bulbs:** {', '.join(missing_enabled)}")
+        if new_discovered:
+            status_lines.append(f"**New bulbs discovered:** {', '.join(new_discovered)}")
+        
+        # Just show results and return
+        return self.async_abort(
+            reason="rescan_complete",
+            description_placeholders={
+                "status": "\n".join(status_lines),
+            },
+        )
+
     async def async_step_debug_commands(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Debug commands menu for connect/disconnect."""
+        """Debug commands menu."""
         return self.async_show_menu(
             step_id="debug_commands",
             menu_options={
@@ -420,55 +464,55 @@ class ESP32BulbRelayOptionsFlow(config_entries.OptionsFlow):
         """Handle debug connect/disconnect action."""
         errors: dict[str, str] = {}
         
-        ports = self._config_entry.data.get(CONF_SERIAL_PORTS, [])
-        bulb_options = self._config_entry.options.get(CONF_BULBS, {})
+        enabled_bulbs = self._config_entry.options.get(CONF_BULBS, [])
         
-        # Build list of all bulbs with their ports
-        all_bulbs: dict[str, str] = {}  # display_name -> "port|bulb_name"
-        for port in ports:
-            bulbs = bulb_options.get(port, [])
-            for bulb in bulbs:
-                display = f"{bulb} ({port})"
-                all_bulbs[display] = f"{port}|{bulb}"
-
-        if not all_bulbs:
+        if not enabled_bulbs:
             return self.async_abort(reason="no_bulbs")
 
         if user_input is not None:
-            selected = user_input["bulb"]
-            port_bulb = all_bulbs.get(selected, "")
+            bulb_name = user_input["bulb"]
             
-            if "|" in port_bulb:
-                port, bulb_name = port_bulb.split("|", 1)
+            # Find which port has this bulb
+            ports = self._config_entry.data.get(CONF_SERIAL_PORTS, [])
+            target_port = None
+            
+            for port in ports:
                 api = ESP32BulbRelaySerialApi(port)
-
                 try:
                     await api.connect()
-                    if action == "connect":
-                        await api.connect_bulb(bulb_name)
-                    else:
-                        await api.disconnect_bulb(bulb_name)
-                    await api.close()
-                    
-                    return self.async_create_entry(title="", data=self._config_entry.options)
+                    bulbs = await api.get_bulbs()
+                    bulb_names = [b.get("name") for b in bulbs]
+                    if bulb_name in bulb_names:
+                        target_port = port
+                        # Execute command
+                        if action == "connect":
+                            await api.connect_bulb(bulb_name)
+                        else:
+                            await api.disconnect_bulb(bulb_name)
+                        await api.close()
+                        return self.async_create_entry(title="", data=self._config_entry.options)
                 except ESP32BulbRelayApiError:
-                    errors["base"] = "command_failed"
+                    pass
                 finally:
                     try:
                         await api.close()
                     except Exception:
                         pass
+            
+            if target_port is None:
+                errors["base"] = "bulb_not_found"
+            else:
+                errors["base"] = "command_failed"
 
+        bulb_options = {name: name for name in enabled_bulbs}
         step_id = f"debug_{action}"
+        
         return self.async_show_form(
             step_id=step_id,
             data_schema=vol.Schema(
                 {
-                    vol.Required("bulb"): vol.In(list(all_bulbs.keys())),
+                    vol.Required("bulb"): vol.In(bulb_options),
                 }
             ),
             errors=errors,
-            description_placeholders={
-                "action": action.capitalize(),
-            },
         )

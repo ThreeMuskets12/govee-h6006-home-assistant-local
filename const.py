@@ -4,14 +4,14 @@ DOMAIN = "esp32_bulb_relay"
 
 # Configuration keys
 CONF_SERIAL_PORT = "serial_port"
-CONF_BULBS = "bulbs"
-CONF_SERIAL_PORTS = "serial_ports"
+CONF_SERIAL_PORTS = "serial_ports"  # List of ports to scan
+CONF_BULBS = "bulbs"  # Flat list of bulb names (not grouped by port)
 
 # Default values
 DEFAULT_BAUD_RATE = 115200
 DEFAULT_TIMEOUT = 30  # Seconds - ESP32 may take several seconds to respond
 
-# API Commands (same as HTTP endpoints, without the leading slash for serial)
+# API Commands
 CMD_BULBS = "/bulbs"
 CMD_BULB_ON = "/bulb/{name}/on"
 CMD_BULB_OFF = "/bulb/{name}/off"
@@ -39,6 +39,7 @@ MIN_COMMAND_INTERVAL = 0.5  # 500ms
 SERVICE_CONNECT_BULB = "connect_bulb"
 SERVICE_DISCONNECT_BULB = "disconnect_bulb"
 SERVICE_REFRESH_BULBS = "refresh_bulbs"
+SERVICE_RESCAN_PORTS = "rescan_ports"
 
 # Attributes
 ATTR_SERIAL_PORT = "serial_port"

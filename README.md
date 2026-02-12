@@ -5,12 +5,22 @@ A Home Assistant custom integration for controlling smart lights via ESP32 Bulb 
 ## Features
 
 - **Serial over USB Communication**: Direct, low-latency connection via serial port at 115200 baud
+- **Dynamic Port Mapping**: Bulbs are identified by name, not by USB port. If ports get reassigned after a reboot, the integration automatically finds bulbs on their new ports
 - **Multi-ESP32 Support**: Add multiple ESP32 devices, each supporting up to 4 bulbs
 - **Full Light Control**: On/Off, Brightness, RGB color, and White Temperature (2000-9000K)
-- **Proper Color Modes**: Separate RGB and Color Temperature modes (no RGBW encoding)
-- **Flexible Configuration**: Add/remove bulbs and ESP32 devices through the UI
-- **Debug Commands**: Manual connect/disconnect for troubleshooting (settings only)
+- **Auto-Rescan**: If a command fails, the integration automatically rescans ports to find the bulb
 - **Command Queue**: Built-in rate limiting (500ms between commands) to prevent overwhelming the ESP32
+
+## How Dynamic Port Mapping Works
+
+USB serial ports (like `/dev/ttyUSB0`, `/dev/ttyUSB1`) can be assigned differently each time the system boots. This integration handles this automatically:
+
+1. **Bulbs are stored by name only** - not tied to specific ports
+2. **On startup**, all configured ports are scanned to build a `bulb → port` mapping
+3. **Every 30 seconds**, the mapping is refreshed
+4. **If a command fails**, the integration rescans all ports and retries
+
+This means if you have two ESP32s and they swap ports after a reboot, your bulbs will still work!
 
 ## Installation
 
@@ -21,9 +31,8 @@ A Home Assistant custom integration for controlling smart lights via ESP32 Bulb 
 3. Click the three dots in the top right corner
 4. Select "Custom repositories"
 5. Add this repository URL and select "Integration" as the category
-6. Click "Add"
-7. Search for "ESP32 Bulb Relay" and install it
-8. Restart Home Assistant
+6. Search for "ESP32 Bulb Relay" and install it
+7. Restart Home Assistant
 
 ### Manual Installation
 
@@ -39,29 +48,54 @@ A Home Assistant custom integration for controlling smart lights via ESP32 Bulb 
 2. Go to **Settings** → **Devices & Services**
 3. Click **Add Integration**
 4. Search for "ESP32 Bulb Relay"
-5. Select the serial port where your ESP32 is connected (e.g., `/dev/ttyUSB0`, `COM3`)
+5. Select the serial port where your ESP32 is connected
 6. Select which bulbs to add to Home Assistant
 7. Click Submit
 
 ### Managing the Integration
 
-After initial setup, click **Configure** on the integration card to access settings:
+Click **Configure** on the integration card to access settings:
 
 #### Manage Bulbs
-Enable or disable individual bulbs from appearing in Home Assistant.
+Enable or disable individual bulbs. The integration scans all ports to show available bulbs.
 
-#### Add ESP32
-Add additional ESP32 Bulb Relay devices to the same integration instance.
+#### Add ESP32 Port
+Add additional serial ports to scan for bulbs.
 
-#### Remove ESP32
-Remove an ESP32 device and all its associated bulbs.
+#### Remove ESP32 Port
+Remove a serial port from scanning. Note: Bulbs might still be found on other ports.
+
+#### Rescan All Ports
+Manually trigger a rescan of all ports. Shows which bulbs were found on which ports, and which bulbs are missing. Useful for troubleshooting.
 
 #### Debug Commands
-Access manual connect/disconnect commands for troubleshooting. These commands are hidden in the debug menu because they should only be used when necessary.
+Access manual connect/disconnect commands for troubleshooting.
+
+## Services
+
+### `esp32_bulb_relay.rescan_ports`
+Rescan all configured serial ports and rebuild the bulb→port mapping. Use this if you've rebooted and ports have changed.
+
+### `esp32_bulb_relay.refresh_bulbs`
+Force refresh all bulb states.
+
+### `esp32_bulb_relay.connect_bulb`
+Manually reconnect a bulb (debug).
+
+| Field | Description |
+|-------|-------------|
+| `bulb_name` | Name of the bulb to connect |
+
+### `esp32_bulb_relay.disconnect_bulb`
+Manually disconnect a bulb (debug).
+
+| Field | Description |
+|-------|-------------|
+| `bulb_name` | Name of the bulb to disconnect |
 
 ## ESP32 Serial Commands
 
-The integration sends commands over serial at 115200 baud. Commands are the same as the HTTP endpoints:
+Commands are sent over serial at 115200 baud:
 
 | Command | Description |
 |---------|-------------|
@@ -75,8 +109,6 @@ The integration sends commands over serial at 115200 baud. Commands are the same
 | `/bulb/{name}/disconnect` | Disconnect bulb (debug) |
 
 ### Response Formats
-
-All responses are JSON. The integration reads lines from serial until it receives valid JSON.
 
 **`/bulbs`**
 ```json
@@ -97,99 +129,79 @@ All responses are JSON. The integration reads lines from serial until it receive
 ```json
 {"success": true, "bulb": "lamp", "action": "on"}
 {"success": true, "bulb": "lamp", "action": "brightness", "value": 75}
-{"success": true, "bulb": "lamp", "action": "rgb", "r": 255, "g": 128, "b": 0}
-{"success": true, "bulb": "lamp", "action": "temperature", "value": 4000}
 ```
 
-## Services
+## Light Entity Attributes
 
-The integration registers the following services:
-
-### `esp32_bulb_relay.connect_bulb`
-Manually reconnect a disconnected bulb.
-
-| Field | Description |
-|-------|-------------|
-| `serial_port` | Serial port of the ESP32 (e.g., `/dev/ttyUSB0`) |
-| `bulb_name` | Name of the bulb to connect |
-
-### `esp32_bulb_relay.disconnect_bulb`
-Manually disconnect a bulb.
-
-| Field | Description |
-|-------|-------------|
-| `serial_port` | Serial port of the ESP32 |
-| `bulb_name` | Name of the bulb to disconnect |
-
-### `esp32_bulb_relay.refresh_bulbs`
-Force refresh all bulb states.
-
-## Light Entity Features
-
-Each bulb is created as a light entity with the following capabilities:
-
-- **On/Off**: Basic on/off control
-- **Brightness**: 0-100% (mapped to 0-255 internally)
-- **RGB Color Mode**: Full RGB color selection
-- **Color Temperature Mode**: White temperature from 2000K to 9000K
-
-### Entity Attributes
-
-Each light entity exposes the following attributes:
+Each light entity shows:
 
 | Attribute | Description |
 |-----------|-------------|
 | `bulb_id` | The bulb's ID on the ESP32 |
 | `address` | The bulb's Bluetooth MAC address |
-| `connected` | Whether the bulb is currently connected |
-| `serial_port` | The serial port of the ESP32 this bulb is connected to |
+| `connected` | Whether the bulb is connected |
+| `current_port` | Which serial port the bulb is currently on |
 
-## Command Queue & Rate Limiting
+## Docker / Home Assistant OS
 
-The integration includes a built-in command queue to prevent overwhelming the ESP32 with rapid requests. Commands are processed with a minimum 500ms delay between each one.
-
-**How it works:**
-- Each ESP32 has its own independent command queue
-- Commands (on, off, brightness, color, temperature) are queued and executed sequentially
-- Status polling (`/bulbs` command) is NOT rate-limited to ensure timely updates
-- If multiple commands are sent quickly (e.g., sliding a brightness slider), they queue up and execute in order
-
-The 500ms interval can be adjusted by modifying `MIN_COMMAND_INTERVAL` in `const.py`.
-
-## Docker / Home Assistant OS Note
-
-If running Home Assistant in Docker or Home Assistant OS, you'll need to ensure the USB device is passed through to the container. For Docker, add:
+If running in Docker, pass through USB devices:
 
 ```yaml
 devices:
   - /dev/ttyUSB0:/dev/ttyUSB0
+  - /dev/ttyUSB1:/dev/ttyUSB1
 ```
 
-For Home Assistant OS, USB devices should be automatically detected.
+For multiple ESP32s, pass through all potential ports.
 
 ## Troubleshooting
 
+### Bulbs show as unavailable after reboot
+1. Go to integration settings → "Rescan All Ports"
+2. Or call the `esp32_bulb_relay.rescan_ports` service
+3. The integration will find bulbs on their new ports
+
 ### No serial ports detected
 - Ensure the ESP32 is connected via USB
-- Check that the USB cable supports data (not charge-only)
-- On Linux, you may need to add your user to the `dialout` group
-- Restart Home Assistant after connecting the device
+- Check that the USB cable supports data
+- On Linux, add your user to the `dialout` group
+- In Docker, ensure devices are passed through
 
-### Cannot connect to ESP32
-- Verify no other application is using the serial port (e.g., Arduino IDE Serial Monitor)
-- Check the baud rate matches (115200)
-- Try unplugging and reconnecting the USB cable
+### Commands failing intermittently
+- The integration will auto-rescan on failure
+- Try increasing `MIN_COMMAND_INTERVAL` in `const.py` if needed
 
-### Bulb not responding
-1. Go to integration settings
-2. Navigate to Debug Commands
-3. Try "Disconnect Bulb" followed by "Connect Bulb"
-4. Check ESP32 serial output for errors
+## Architecture
 
-### Bulbs not appearing
-- Ensure the bulbs are enabled in "Manage Bulbs" settings
-- Try the "Refresh Bulbs" service
-- Restart Home Assistant
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Home Assistant                        │
+├─────────────────────────────────────────────────────────┤
+│  Light Entity: "LeftLamp"    Light Entity: "Ceiling1"   │
+│         │                           │                    │
+│         └───────────┬───────────────┘                    │
+│                     ▼                                    │
+│              ┌─────────────┐                             │
+│              │ Coordinator │                             │
+│              │ bulb→port   │                             │
+│              │ mapping     │                             │
+│              └─────────────┘                             │
+│                     │                                    │
+│         ┌───────────┴───────────┐                       │
+│         ▼                       ▼                       │
+│   ┌───────────┐           ┌───────────┐                │
+│   │ API Client│           │ API Client│                │
+│   │/dev/ttyUSB0│          │/dev/ttyUSB1│               │
+│   └───────────┘           └───────────┘                │
+└─────────────────────────────────────────────────────────┘
+         │                       │
+         ▼                       ▼
+    ┌─────────┐            ┌─────────┐
+    │  ESP32  │            │  ESP32  │
+    │ LeftLamp│            │Ceiling1 │
+    │RightLamp│            │Ceiling2 │
+    └─────────┘            └─────────┘
+```
 
 ## Contributing
 
