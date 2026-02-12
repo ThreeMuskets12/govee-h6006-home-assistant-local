@@ -62,17 +62,19 @@ class ESP32BulbRelaySerialApi:
             return
         
         try:
+            # Use a larger limit for the reader to handle binary garbage
             self._reader, self._writer = await serial_asyncio.open_serial_connection(
                 url=self._port,
                 baudrate=self._baud_rate,
+                limit=65536,  # 64KB buffer limit
             )
             self._connected = True
             _LOGGER.info("Connected to ESP32 on %s", self._port)
             
-            # Give ESP32 time to reset after connection
+            # Give ESP32 time to finish any reset/boot sequence
             await asyncio.sleep(2)
             
-            # Clear any startup messages from buffer
+            # Clear any startup messages/garbage from buffer
             await self._clear_buffer()
             
         except Exception as err:
@@ -86,14 +88,19 @@ class ESP32BulbRelaySerialApi:
         if self._reader is None:
             return
         try:
+            # Read and discard any pending data
             while True:
                 try:
                     async with asyncio.timeout(0.1):
-                        await self._reader.readline()
+                        # Read raw bytes, don't try to decode
+                        data = await self._reader.read(1024)
+                        if not data:
+                            break
+                        _LOGGER.debug("Cleared %d bytes from buffer on %s", len(data), self._port)
                 except asyncio.TimeoutError:
                     break
-        except Exception:
-            pass
+        except Exception as err:
+            _LOGGER.debug("Error clearing buffer: %s", err)
 
     async def close(self) -> None:
         """Close the serial connection."""
@@ -132,27 +139,70 @@ class ESP32BulbRelaySerialApi:
                 
                 # Read response with timeout
                 async with asyncio.timeout(self._timeout):
-                    while True:
-                        line = await self._reader.readline()
-                        line_str = line.decode('utf-8').strip()
+                    attempts = 0
+                    max_attempts = 50  # Prevent infinite loops
+                    
+                    while attempts < max_attempts:
+                        attempts += 1
+                        
+                        # Read with a reasonable limit to avoid memory issues
+                        try:
+                            # readuntil with limit, or fallback to read
+                            line = await self._reader.readuntil(b'\n')
+                        except asyncio.IncompleteReadError as e:
+                            # Got partial data, try to use it
+                            line = e.partial
+                        except asyncio.LimitOverrunError:
+                            # Line too long, read and discard chunk
+                            _LOGGER.debug("Line too long, discarding data")
+                            await self._reader.read(4096)
+                            continue
+                        except Exception as read_err:
+                            _LOGGER.debug("Read error: %s", read_err)
+                            # Try reading raw bytes instead
+                            try:
+                                line = await self._reader.read(1024)
+                            except Exception:
+                                continue
+                        
+                        if not line:
+                            continue
+                        
+                        # Try to decode as UTF-8, skip binary garbage
+                        try:
+                            line_str = line.decode('utf-8', errors='ignore').strip()
+                        except Exception:
+                            _LOGGER.debug("Could not decode line, skipping")
+                            continue
                         
                         if not line_str:
                             continue
                         
-                        _LOGGER.debug("Received from %s: %s", self._port, line_str)
+                        # Skip lines that are obviously not JSON
+                        if not (line_str.startswith('{') or line_str.startswith('[')):
+                            _LOGGER.debug("Skipping non-JSON line: %s", line_str[:100])
+                            continue
+                        
+                        _LOGGER.debug("Received from %s: %s", self._port, line_str[:200])
                         
                         # Try to parse as JSON
                         try:
                             result = json.loads(line_str)
                             return result
                         except json.JSONDecodeError:
-                            _LOGGER.debug("Skipping non-JSON line: %s", line_str)
+                            _LOGGER.debug("Invalid JSON, skipping")
                             continue
+                    
+                    raise ESP32BulbRelayConnectionError(
+                        f"No valid JSON response after {max_attempts} attempts"
+                    )
                             
             except asyncio.TimeoutError as err:
                 raise ESP32BulbRelayConnectionError(
                     f"Timeout waiting for response from {self._port}"
                 ) from err
+            except ESP32BulbRelayConnectionError:
+                raise
             except Exception as err:
                 self._connected = False
                 raise ESP32BulbRelayApiError(
