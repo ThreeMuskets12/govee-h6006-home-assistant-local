@@ -17,6 +17,7 @@ from .const import (
     CMD_BULB_RGB,
     CMD_BULB_TEMPERATURE,
     CMD_BULBS,
+    COMMAND_TIMEOUT,
     DEFAULT_BAUD_RATE,
     DEFAULT_TIMEOUT,
 )
@@ -69,24 +70,25 @@ class ESP32BulbRelaySerialApi:
         _LOGGER.info("Attempting to connect to %s at %d baud", self._port, self._baud_rate)
         
         try:
-            # Set a timeout for the connection attempt itself
-            async with asyncio.timeout(10):
+            # Wrap the ENTIRE connection sequence in a timeout
+            # This includes serial open, boot wait, and buffer clear
+            async with asyncio.timeout(15):
                 self._reader, self._writer = await serial_asyncio.open_serial_connection(
                     url=self._port,
                     baudrate=self._baud_rate,
                 )
-            
-            self._connected = True
-            _LOGGER.info("Serial connection established to %s", self._port)
-            
-            # Give ESP32 time to finish any reset/boot sequence
-            _LOGGER.debug("Waiting 2s for ESP32 boot sequence on %s", self._port)
-            await asyncio.sleep(2)
-            
-            # Clear any startup messages/garbage from buffer
-            _LOGGER.debug("Clearing buffer on %s", self._port)
-            await self._clear_buffer()
-            _LOGGER.info("Connection to %s ready", self._port)
+                
+                self._connected = True
+                _LOGGER.info("Serial connection established to %s", self._port)
+                
+                # Give ESP32 time to finish any reset/boot sequence
+                # Reduced from 2s since we also clear buffer
+                _LOGGER.debug("Waiting 1s for ESP32 boot sequence on %s", self._port)
+                await asyncio.sleep(1)
+                
+                # Clear any startup messages/garbage from buffer
+                await self._clear_buffer()
+                _LOGGER.info("Connection to %s ready", self._port)
             
         except asyncio.TimeoutError:
             self._connected = False
@@ -102,39 +104,83 @@ class ESP32BulbRelaySerialApi:
             ) from err
 
     async def _clear_buffer(self) -> None:
-        """Clear any pending data in the read buffer."""
+        """Clear any pending data in the read buffer.
+        
+        This has strict time limits to prevent blocking HA startup.
+        """
         if self._reader is None:
             return
         
         total_cleared = 0
+        start_time = asyncio.get_event_loop().time()
+        max_time = 2.0  # Maximum 2 seconds total for buffer clearing
+        max_bytes = 65536  # Maximum 64KB to clear
+        
+        _LOGGER.debug("Clearing buffer on %s", self._port)
+        
         try:
-            # Read and discard any pending data with short timeout
             while True:
-                try:
-                    async with asyncio.timeout(0.2):
-                        data = await self._reader.read(4096)
-                        if not data:
-                            break
-                        total_cleared += len(data)
-                        _LOGGER.debug("Cleared %d bytes from %s (total: %d)", 
-                                     len(data), self._port, total_cleared)
-                except asyncio.TimeoutError:
+                # Check overall time limit
+                elapsed = asyncio.get_event_loop().time() - start_time
+                if elapsed > max_time:
+                    _LOGGER.debug(
+                        "Buffer clear time limit (%.1fs) reached on %s, cleared %d bytes",
+                        max_time, self._port, total_cleared
+                    )
                     break
+                
+                # Check bytes limit
+                if total_cleared > max_bytes:
+                    _LOGGER.warning(
+                        "Buffer clear bytes limit (%d) reached on %s - too much data",
+                        max_bytes, self._port
+                    )
+                    break
+                
+                try:
+                    # Use wait_for which is more reliable than timeout context
+                    data = await asyncio.wait_for(
+                        self._reader.read(1024),  # Smaller chunks
+                        timeout=0.1  # Very short timeout
+                    )
+                    if not data:
+                        _LOGGER.debug("No more data to clear on %s", self._port)
+                        break
+                    total_cleared += len(data)
+                except asyncio.TimeoutError:
+                    # No data available - buffer is clear
+                    _LOGGER.debug("Buffer clear complete on %s (timeout, %d bytes cleared)", 
+                                 self._port, total_cleared)
+                    break
+                except Exception as read_err:
+                    _LOGGER.debug("Read error during buffer clear on %s: %s", self._port, read_err)
+                    break
+                    
         except Exception as err:
             _LOGGER.debug("Error clearing buffer on %s: %s", self._port, err)
         
         if total_cleared > 0:
-            _LOGGER.debug("Total cleared from %s: %d bytes", self._port, total_cleared)
+            _LOGGER.info("Cleared %d bytes from buffer on %s", total_cleared, self._port)
 
     async def close(self) -> None:
         """Close the serial connection."""
         _LOGGER.debug("Closing connection to %s", self._port)
-        await self._command_queue.stop()
+        
+        try:
+            await self._command_queue.stop()
+        except Exception as err:
+            _LOGGER.debug("Error stopping command queue for %s: %s", self._port, err)
         
         if self._writer:
             try:
                 self._writer.close()
-                await self._writer.wait_closed()
+                # Add timeout to wait_closed to prevent hanging
+                await asyncio.wait_for(
+                    self._writer.wait_closed(),
+                    timeout=2.0
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.debug("Timeout waiting for writer to close on %s", self._port)
             except Exception as err:
                 _LOGGER.debug("Error closing writer for %s: %s", self._port, err)
         
@@ -144,35 +190,57 @@ class ESP32BulbRelaySerialApi:
         _LOGGER.info("Disconnected from %s", self._port)
 
     async def _read_line_safe(self, timeout: float = 5.0) -> bytes | None:
-        """Read a line with timeout, handling errors gracefully."""
+        """Read a line with timeout, handling errors gracefully.
+        
+        Uses individual timeouts per read operation to prevent any single
+        read from blocking indefinitely.
+        """
         if self._reader is None:
             return None
         
+        line = b""
+        start_time = asyncio.get_event_loop().time()
+        
         try:
-            async with asyncio.timeout(timeout):
-                # Read byte by byte until newline to avoid buffer issues
-                line = b""
-                while True:
-                    byte = await self._reader.read(1)
-                    if not byte:
-                        if line:
-                            return line
-                        return None
-                    if byte == b'\n':
-                        return line
-                    if byte == b'\r':
-                        continue  # Skip carriage returns
-                    line += byte
-                    # Limit line length to prevent memory issues
-                    if len(line) > 8192:
-                        _LOGGER.warning("Line too long on %s, truncating", self._port)
-                        return line
-        except asyncio.TimeoutError:
-            _LOGGER.debug("Read timeout on %s (got %d bytes so far)", self._port, len(line) if 'line' in dir() else 0)
-            return None
+            while True:
+                # Check overall timeout
+                elapsed = asyncio.get_event_loop().time() - start_time
+                if elapsed > timeout:
+                    _LOGGER.debug("Read timeout on %s after %.1fs (got %d bytes)", 
+                                 self._port, elapsed, len(line))
+                    return line if line else None
+                
+                # Remaining time for this read
+                remaining = max(0.1, timeout - elapsed)
+                
+                try:
+                    # Read one byte with timeout
+                    byte = await asyncio.wait_for(
+                        self._reader.read(1),
+                        timeout=min(remaining, 0.5)  # Max 0.5s per byte
+                    )
+                except asyncio.TimeoutError:
+                    # Return what we have so far
+                    return line if line else None
+                
+                if not byte:
+                    return line if line else None
+                    
+                if byte == b'\n':
+                    return line
+                if byte == b'\r':
+                    continue  # Skip carriage returns
+                    
+                line += byte
+                
+                # Limit line length to prevent memory issues
+                if len(line) > 8192:
+                    _LOGGER.warning("Line too long on %s, truncating", self._port)
+                    return line
+                    
         except Exception as err:
             _LOGGER.debug("Read error on %s: %s", self._port, err)
-            return None
+            return line if line else None
 
     async def _send_command(self, command: str, timeout: float | None = None) -> dict[str, Any]:
         """Send a command and wait for JSON response."""
@@ -281,9 +349,12 @@ class ESP32BulbRelaySerialApi:
                 _LOGGER.debug("Released lock for %s", self._port)
 
     async def _queued_command(self, command: str) -> dict[str, Any]:
-        """Send a rate-limited command through the queue."""
+        """Send a rate-limited command through the queue.
+        
+        Uses COMMAND_TIMEOUT since bulb commands may involve BLE reconnection.
+        """
         return await self._command_queue.enqueue(
-            lambda: self._send_command(command)
+            lambda: self._send_command(command, timeout=COMMAND_TIMEOUT)
         )
 
     def _check_success(self, result: dict[str, Any], action: str) -> None:

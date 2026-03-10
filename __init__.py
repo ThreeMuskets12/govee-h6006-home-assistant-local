@@ -48,28 +48,54 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Get enabled bulbs from options (flat list)
     enabled_bulbs = set(entry.options.get(CONF_BULBS, []))
     
+    _LOGGER.info(
+        "Setting up ESP32 Bulb Relay with %d ports and %d enabled bulbs",
+        len(serial_ports),
+        len(enabled_bulbs)
+    )
+    
     # Create coordinator
     coordinator = ESP32BulbRelayCoordinator(hass, serial_ports)
     coordinator.set_enabled_bulbs(enabled_bulbs)
     
     # Initialize API connections for each port
+    # Note: ESP32s may be booting and connecting to BLE bulbs, so we don't
+    # fail if initial connection doesn't work - the coordinator will retry
     for port in serial_ports:
         api = ESP32BulbRelaySerialApi(port)
         coordinator._apis[port] = api
         
         try:
+            _LOGGER.info("Connecting to %s...", port)
             await api.connect()
+            _LOGGER.info("Connected to %s", port)
         except Exception as err:
-            _LOGGER.warning("Failed to connect to %s: %s", port, err)
+            # Don't fail setup - ESP32 might still be booting
+            _LOGGER.warning(
+                "Could not connect to %s on startup (ESP32 may still be booting): %s",
+                port, err
+            )
     
-    # Do initial scan to build bulb->port mapping
-    await coordinator.async_rescan_all_ports()
+    # Try initial scan, but don't fail if it doesn't work
+    # ESP32s may need time to finish their BLE connections
+    _LOGGER.info("Attempting initial port scan (ESP32s may still be booting)...")
+    try:
+        await coordinator.async_rescan_all_ports()
+    except Exception as err:
+        _LOGGER.warning("Initial scan incomplete: %s (will retry)", err)
     
-    # Fetch initial data
-    await coordinator.async_config_entry_first_refresh()
-    
-    # Store coordinator
+    # Store coordinator BEFORE first refresh so entities can be created
     hass.data[DOMAIN][entry.entry_id] = coordinator
+    
+    # Do first refresh - if it fails, that's okay, coordinator will retry
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except Exception as err:
+        _LOGGER.warning(
+            "First data refresh failed (ESP32s may still be booting): %s",
+            err
+        )
+        # Don't raise - let the coordinator retry on its schedule
     
     # Set up platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -79,6 +105,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     
     # Listen for options updates
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+    
+    _LOGGER.info("ESP32 Bulb Relay setup complete (background updates will continue)")
     
     return True
 

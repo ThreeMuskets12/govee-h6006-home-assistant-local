@@ -1,6 +1,7 @@
 """Data coordinator for ESP32 Bulb Relay."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 from typing import Any
@@ -9,7 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import ESP32BulbRelaySerialApi, ESP32BulbRelayApiError
-from .const import DOMAIN, UPDATE_INTERVAL
+from .const import DOMAIN, UPDATE_INTERVAL, POLL_TIMEOUT
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -119,8 +120,8 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug("Connecting to port %s", port)
                 await api.connect()
             
-            _LOGGER.debug("Querying /bulbs on port %s", port)
-            bulbs = await api.get_bulbs()
+            _LOGGER.debug("Querying /bulbs on port %s (timeout=%ds)", port, POLL_TIMEOUT)
+            bulbs = await api.get_bulbs(timeout=POLL_TIMEOUT)
             self._port_online[port] = True
             
             _LOGGER.info(
@@ -195,10 +196,17 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return new_mapping
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch data from all ESP32s and update bulb->port mapping."""
+        """Fetch data from all ESP32s and update bulb->port mapping.
+        
+        This method is designed to be resilient:
+        - Partial failures (some ports offline) don't fail the whole update
+        - We return whatever data we could get
+        - Entities use cached data if their bulb wasn't reachable
+        """
         _LOGGER.debug("Starting coordinator data update")
         
         # Rescan all ports to update mapping
+        # This won't raise - it handles errors internally per-port
         await self.async_rescan_all_ports()
         
         # Build data structure for entities
@@ -208,11 +216,14 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
         
         # Add port status
+        ports_online = 0
         for port in self._serial_ports:
             online = self._port_online.get(port, False)
             data["ports"][port] = {
                 "online": online,
             }
+            if online:
+                ports_online += 1
             _LOGGER.debug("Port %s: online=%s", port, online)
         
         # Add bulb data with current port info
@@ -235,12 +246,15 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 port_online
             )
         
-        _LOGGER.debug(
-            "Coordinator update complete: %d ports, %d bulbs",
-            len(data["ports"]),
+        _LOGGER.info(
+            "Coordinator update complete: %d/%d ports online, %d bulbs tracked",
+            ports_online,
+            len(self._serial_ports),
             len(data["bulbs"])
         )
         
+        # Return data even if some/all ports are offline
+        # The entity availability is determined by individual bulb "connected" status
         return data
 
     async def async_send_command(
@@ -311,11 +325,19 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_shutdown(self) -> None:
         """Shutdown all API connections."""
-        for api in self._apis.values():
+        _LOGGER.debug("Shutting down coordinator with %d API connections", len(self._apis))
+        
+        for port, api in self._apis.items():
             try:
-                await api.close()
-            except Exception:
-                pass
+                _LOGGER.debug("Closing connection to %s", port)
+                # Each close has its own internal timeout, but add a wrapper just in case
+                await asyncio.wait_for(api.close(), timeout=5.0)
+            except asyncio.TimeoutError:
+                _LOGGER.warning("Timeout closing connection to %s", port)
+            except Exception as err:
+                _LOGGER.debug("Error closing %s: %s", port, err)
+        
         self._apis.clear()
         self._bulb_port_map.clear()
         self._bulb_data.clear()
+        _LOGGER.debug("Coordinator shutdown complete")

@@ -58,7 +58,13 @@ class CommandQueue:
         if self._processor_task:
             self._processor_task.cancel()
             try:
-                await self._processor_task
+                # Add timeout to prevent hanging
+                await asyncio.wait_for(
+                    asyncio.shield(self._processor_task),
+                    timeout=2.0
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.debug("Queue processor stop timed out")
             except asyncio.CancelledError:
                 pass
             self._processor_task = None

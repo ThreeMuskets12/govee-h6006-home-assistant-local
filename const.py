@@ -9,7 +9,18 @@ CONF_BULBS = "bulbs"  # Flat list of bulb names (not grouped by port)
 
 # Default values
 DEFAULT_BAUD_RATE = 115200
-DEFAULT_TIMEOUT = 30  # Seconds - ESP32 may take several seconds to respond
+
+# Timeouts (in seconds)
+# Command timeout - for regular commands to ESP32
+# The /bulbs query should be fast, but control commands may need longer
+# if the ESP32 is reconnecting to a bulb
+DEFAULT_TIMEOUT = 10  # Reduced from 30 - /bulbs should respond quickly
+
+# Longer timeout for commands that involve BLE operations
+COMMAND_TIMEOUT = 15  # For on/off/brightness/color commands
+
+# Status poll timeout - shorter since we poll frequently
+POLL_TIMEOUT = 5  # For /bulbs status queries
 
 # API Commands
 CMD_BULBS = "/bulbs"
