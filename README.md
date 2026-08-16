@@ -2,6 +2,9 @@
 
 A Home Assistant custom integration for controlling smart lights via ESP32 Bulb Relay devices over USB serial connection.
 
+This repository contains the Home Assistant integration. The ESP32 firmware that implements the
+serial protocol is required separately and is not built or flashed from this project.
+
 ## Features
 
 - **Serial over USB Communication**: Direct, low-latency connection via serial port at 115200 baud
@@ -37,7 +40,8 @@ This means if you have two ESP32s and they swap ports after a reboot, your bulbs
 ### Manual Installation
 
 1. Download or clone this repository
-2. Copy the `esp32_bulb_relay` folder to your `config/custom_components/` directory
+2. Copy `custom_components/esp32_bulb_relay` to your Home Assistant
+   `config/custom_components/esp32_bulb_relay` directory
 3. Restart Home Assistant
 
 ## Configuration
@@ -206,6 +210,20 @@ For multiple ESP32s, pass through all potential ports.
 ## Contributing
 
 Contributions are welcome! Please feel free to submit issues and pull requests.
+
+### Development validation
+
+The integration is hardware-dependent, but its source and metadata can be checked without an ESP32:
+
+```shell
+python -m compileall -q custom_components/esp32_bulb_relay
+python -m json.tool custom_components/esp32_bulb_relay/manifest.json
+python -m json.tool custom_components/esp32_bulb_relay/translations/en.json
+python -m json.tool hacs.json
+```
+
+End-to-end validation requires Home Assistant plus an attached ESP32 that implements the documented
+newline-delimited JSON serial protocol.
 
 ## License
 

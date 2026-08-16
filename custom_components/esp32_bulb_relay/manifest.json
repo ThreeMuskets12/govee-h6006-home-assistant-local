@@ -1,0 +1,13 @@
+{
+  "domain": "esp32_bulb_relay",
+  "name": "ESP32 Bulb Relay",
+  "codeowners": ["@ThreeMuskets12"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/ThreeMuskets12/govee-esp32-blaster",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/ThreeMuskets12/govee-esp32-blaster/issues",
+  "requirements": ["pyserial-asyncio-fast>=0.11"],
+  "single_config_entry": true,
+  "version": "1.1.0"
+}
