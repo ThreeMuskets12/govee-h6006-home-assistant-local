@@ -2,8 +2,12 @@
 
 ## Scope and layout
 
-- This repository contains only the Home Assistant custom integration in
-  `custom_components/esp32_bulb_relay/`. The ESP32 firmware is a separate dependency.
+- This repository contains the Home Assistant custom integration in
+  `custom_components/esp32_bulb_relay/` and the recovered Arduino firmware in
+  `firmware/govee_controller_serial/`. See `firmware/PROVENANCE.md` for source identity.
+- Preserve the recovered sketch unless firmware changes are explicitly in scope. Setup prompts
+  require `DEBUG=1`; normal operation uses `DEBUG=0`. Default NimBLE allows three connections,
+  even though the sketch has four slots. Never flash deployed boards as part of documentation work.
 - `api.py` owns the serial transport and one rate-limited command queue per port.
 - `coordinator.py` owns port clients, 30-second polling, and the dynamic bulb-name-to-port map.
 - `config_flow.py` stores serial ports in config-entry data and enabled bulb names in options.
