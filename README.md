@@ -1,173 +1,30 @@
-# Govee H6006 + Home Assistant: local, offline control with ESP32
+# Govee H6006 bulbs in Home Assistant, without the cloud
 
-Control Govee H6006 smart bulbs from Home Assistant without the Govee cloud. A USB-connected ESP32 maintains Bluetooth Low Energy (BLE) connections to the bulbs and translates Home Assistant commands into Govee's BLE packets. This repository contains both the **ESP32 Bulb Relay** Home Assistant integration and the **Arduino firmware**.
+[Beshelmek's Govee BLE Lights](https://github.com/Beshelmek/govee_ble_lights) is a really cool project. But with my H6006 bulbs, BLE directly from the Raspberry Pi was flaky. Connections would drop and controlling the lights wasn't reliable enough for everyday use.
 
-## Govee H6006 not working reliably with Home Assistant Bluetooth?
+I didn't want to fall back to the Govee API. These are lightbulbs; I want them to work with their internet access blocked. That meant finding a way to keep the Bluetooth connections working.
 
-The H6006 supports BLE, but direct Bluetooth control from the Raspberry Pi running Home Assistant was unreliable in this project's installation. Repeated connection problems made everyday light control frustrating. Keeping the BLE connections on dedicated ESP32s was the approach that delivered reliable, responsive local control here.
+This project uses ESP32s to hold persistent BLE connections to the H6006s. The ESP32s send keepalives and reconnect if a bulb drops out. They plug into the Raspberry Pi over USB, and Home Assistant sends light commands over serial. The bulbs don't need internet access, and the ESP32s don't use Wi-Fi.
 
-The ESP32 acts as the BLE controller in place of the Govee phone app. It holds connections open, sends keepalives, and reconnects when a bulb drops out. Home Assistant only needs a USB serial connection. Neither the ESP32 firmware nor this integration uses Wi-Fi, MQTT, a Govee account, an API key, or Govee's servers during operation. Bulb internet access can be blocked independently at your router.
+Both parts are here: the Home Assistant integration in `custom_components/esp32_bulb_relay/` and the [ESP32 Arduino sketch](firmware/govee_controller_serial/govee_controller_serial.ino).
 
-That is the motivation and experience behind this project, not a claim that every Raspberry Pi/BLE combination fails or that any radio connection is infallible. The integration spaces control commands on each ESP32 by at least **500 ms**; several queued changes or a reconnect take longer. No universal latency benchmark is claimed.
+## Setup
 
-```mermaid
-flowchart LR
-    HA[Home Assistant on Raspberry Pi] -->|USB serial · 115200 baud| A[ESP32 + NimBLE]
-    HA -->|USB serial · 115200 baud| B[Additional ESP32]
-    A -->|Persistent BLE + keepalives| C[Govee H6006 bulbs]
-    B -->|Persistent BLE + keepalives| D[More H6006 bulbs]
-```
+You'll need H6006 bulbs, BLE-capable ESP32 boards, USB data cables, and Home Assistant. The sketch compiles for ESP32 Dev Module with Espressif's Arduino core 3.3.5 and NimBLE-Arduino 2.3.7. Use up to three bulbs per ESP32 with that library's default settings.
 
-## Can Govee H6006 bulbs work without internet or the cloud?
+1. Open the sketch in Arduino IDE. Set `DEBUG` to `1`, upload, and open Serial Monitor at 115200 baud with Newline endings. Reset the board, select your bulbs from the scan, give each a unique name, and send `-1` to save.
+2. Set `DEBUG` back to `0` and upload again without erasing flash or changing partitions. The board remembers its bulbs. Close Serial Monitor and plug the ESP32 into your Home Assistant host.
+3. In HACS, add `https://github.com/ThreeMuskets12/govee-h6006-home-assistant-local` as a custom repository, category Integration. Install **Govee H6006 Local (ESP32 Bulb Relay)** and restart Home Assistant.
+4. Go to **Settings → Devices & services → Add integration → ESP32 Bulb Relay**, select the serial port, and choose your bulbs. Add more boards through **Configure → Add ESP32 Port**.
 
-Yes: this project sends on/off, brightness, RGB, and white-temperature commands over local BLE. It addresses the need for a privacy-focused Home Assistant setup without cloud-dependent light control. After provisioning, the ESP32s use USB and Bluetooth only. The bulbs' Wi-Fi/cloud behavior is separate: block their internet access at the network if you want to enforce offline operation. This project does not replace the bulb firmware or require a Govee cloud integration.
+The [setup guide](docs/setup.md) covers flashing, changing bulb assignments, manual installation, USB passthrough, and troubleshooting. First-time setup needs `DEBUG=1` because the production build hides the prompts.
 
-## What is supported?
+## A few things to know
 
-- H6006 on/off, brightness, RGB color, and a protocol temperature range of 2000–9000 K. Other models and their physical color-temperature ranges have not been verified.
-- Multiple USB-connected ESP32s, with bulbs routed by their configured names.
-- Saved bulb assignments in ESP32 nonvolatile storage (NVS), restored after reboot.
-- Three-second BLE keepalives and automatic reconnection. After three failed connection attempts, the firmware backs off to one attempt per minute until recovery.
-- A Home Assistant command queue per port, connectivity polling every 30 seconds, and port rescanning/retry on command failure.
+Power, brightness, RGB, and white temperature are supported for the H6006. I haven't verified other models. Every bulb needs a different name, even across separate ESP32s.
 
-The sketch has four bulb slots, but **NimBLE-Arduino 2.3.7 defaults to three simultaneous connections**. Start with at most three bulbs per ESP32. Four requires a library build configured for at least four connections and hardware validation; simply having `MAX_BULBS = 4` in the sketch does not increase the BLE library's limit.
+Home Assistant remembers the commands it sends; it doesn't read the bulb's actual power or color back. Commands on each ESP32 are spaced at least 500 ms apart, so several queued changes take longer.
 
-Home Assistant light state is **optimistic**: `/bulbs` reports connectivity, not actual power, brightness, or color. Changes made through another controller or a wall switch are not fully synchronized. The refresh action refreshes connectivity, not those light properties.
+The firmware is preserved from the latest local sketch I found. Both production and setup builds compile, but I haven't compared it with a binary readback from the installed boards. [Firmware details](firmware/PROVENANCE.md).
 
-## What you need
-
-- Govee H6006 bulbs, powered and within BLE range of their assigned ESP32.
-- A BLE-capable ESP32 development board and USB **data** cable per group of bulbs. The compile-checked target is the classic **ESP32 Dev Module** (`esp32:esp32:esp32`); other board variants are not verified.
-- Home Assistant with access to those USB serial devices. A powered USB hub may help when using several boards.
-- Arduino IDE with **esp32 by Espressif Systems 3.3.5** and **NimBLE-Arduino by h2zero 2.3.7**. `Preferences` comes with the ESP32 core. See [Espressif's installation guide](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html) and [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino).
-
-These versions are the locally available build baseline, not a requirement to upgrade a working installation. Internet access is needed to download development tools and install the integration; light commands are local afterward.
-
-## 1. Flash and provision each ESP32
-
-The firmware is [firmware/govee_controller_serial/govee_controller_serial.ino](firmware/govee_controller_serial/govee_controller_serial.ino). It is an Arduino sketch, not a PlatformIO project. It is preserved unchanged from the recovered source; see [firmware provenance](firmware/PROVENANCE.md).
-
-**First-time setup needs `DEBUG=1`.** The recovered production sketch sets `DEBUG=0`, which also hides the interactive provisioning prompts. Flashing that default onto a blank board leaves it waiting silently for bulb selection.
-
-1. Download or clone this repository and open the `.ino` file in Arduino IDE. Keep the enclosing folder named `govee_controller_serial`.
-2. Install the board core and NimBLE library listed above. Select your board and USB port. For the classic ESP32 target, use **ESP32 Dev Module**.
-3. In the sketch, temporarily change `#define DEBUG 0` to `#define DEBUG 1`. Set **Erase All Flash Before Sketch Upload** to **Disabled** and leave it disabled for the subsequent production upload.
-4. Upload. Open Serial Monitor at **115200 baud**, with **Newline** line endings, then press the board's reset button so you can see the startup sequence.
-5. A board without saved assignments scans BLE devices for about five seconds and prints a numbered list. Choose the number for a known H6006, send it, then send a unique bulb name when prompted. The scan includes unrelated BLE devices: identify your bulbs by their advertised name/address, using one powered bulb at a time if needed. Close the Govee app while connecting.
-6. Repeat for up to **three bulbs** with the default library. Use simple names such as `desk_lamp` or `ceiling_1`, containing only letters, digits, underscores, or hyphens. Names must be unique across **all** ESP32s, including case-insensitive comparisons. Names are routing/entity identifiers; quotes, slashes, and other special characters are not safely escaped by this firmware.
-7. Send `-1` to finish. At least one successfully connected bulb is required. Wait for setup to complete so the firmware saves the names and addresses in NVS.
-8. Send `/bulbs`. Expect one JSON line listing the configured bulbs and their connection status.
-9. Change `DEBUG` back to **0** and upload again, **without erasing flash or changing the partition scheme**. Saved bulb assignments survive a normal upload. Let the five-second setup window expire without sending anything; the ESP32 reconnects automatically.
-10. Check `/bulbs` again, close Serial Monitor, and connect the board to the Home Assistant host. Only one program should own its serial port at a time.
-
-To change assignments later, use the debug build, open Serial Monitor, reset the board, and send `s` during the five-second saved-configuration prompt. This rebuilds that board's bulb list; finish with `-1`, then return to `DEBUG=0`. Preserve existing names if you want to preserve Home Assistant routing and entities.
-
-## 2. Install the Home Assistant integration
-
-### HACS
-
-Follow [HACS custom repository instructions](https://www.hacs.xyz/docs/faq/custom_repositories/): open HACS, use the three-dot menu → **Custom repositories**, add `https://github.com/ThreeMuskets12/govee-h6006-home-assistant-local`, and choose **Integration**. Search for **Govee H6006 Local (ESP32 Bulb Relay)**, download it, and restart Home Assistant.
-
-### Manual installation
-
-Copy this repository's `custom_components/esp32_bulb_relay` folder to your Home Assistant configuration directory:
-
-```text
-/config/custom_components/esp32_bulb_relay/manifest.json
-/config/custom_components/esp32_bulb_relay/__init__.py
-/config/custom_components/esp32_bulb_relay/...
-```
-
-Copy the entire integration folder and restart Home Assistant. The `firmware` folder does not belong in `/config/custom_components`; it is compiled and uploaded separately to the ESP32s.
-
-## 3. Add ports and lights
-
-1. Connect a provisioned ESP32 by USB to the Home Assistant host.
-2. Open **Settings → Devices & services → Add integration → ESP32 Bulb Relay**.
-3. Select the ESP32's serial port, then select which configured bulbs to expose as lights.
-4. For additional boards, use **Configure → Add ESP32 Port** on the existing integration. Use **Manage Bulbs** to select enabled bulbs.
-5. Test one light's power, brightness, RGB, and white-temperature controls.
-
-The integration polls configured ports to rebuild a bulb-name-to-port map. If `/dev/ttyUSB0` and `/dev/ttyUSB1` swap, it can find the names again as long as both ports are configured. A completely new port path must be added. Duplicate bulb names on different boards collide; the last scanned port wins.
-
-### USB access
-
-On Home Assistant OS, attach the boards to the host and check **Settings → System → Hardware → All hardware** if ports are missing. When Home Assistant runs in a VM, pass each USB device through to the VM. For a container, map the devices explicitly, for example in Compose:
-
-```yaml
-devices:
-  - /dev/ttyUSB0:/dev/ttyUSB0
-  - /dev/ttyUSB1:/dev/ttyUSB1
-```
-
-Include every configured port and ensure the Home Assistant process has serial-device permissions. Avoid giving another serial monitor or service simultaneous access to these ports.
-
-## Troubleshooting
-
-| Symptom | Check |
-| --- | --- |
-| Blank first-time Serial Monitor; `/bulbs` never responds | Provision with `DEBUG=1`, 115200 baud, and Newline. Reset after opening the monitor. A blank board waits for interactive setup. |
-| Bulb missing from scan | Keep it powered and nearby, close the phone app, and reset/re-run setup to scan again. The scan only stores the first 50 results. |
-| Fourth bulb cannot connect | Default NimBLE builds allow three connections. Use another ESP32 rather than selecting a fourth with this build. |
-| Bulbs unavailable just after reboot | Allow the startup/setup window and BLE reconnections to finish; then use **Rescan All Ports**. |
-| USB port missing | Check the data cable, power, USB passthrough/permissions, and whether the path changed. Add any new path in Configure. |
-| Commands fail intermittently | Check bulb power, BLE range, USB power, and competing controllers. Firmware reconnects automatically; backoff can take up to a minute between attempts. |
-| Several light changes take time | Commands are queued with a 500 ms minimum interval per board. Reconnection adds further delay. |
-| HA state differs from the bulb | State is optimistic; external power/color changes are not read back. |
-
-Opening a serial connection can reset an ESP32. Provision and test it before handing the port to Home Assistant. Debug disconnect is temporary: the background monitor will try to reconnect the bulb.
-
-## Serial protocol and Home Assistant actions
-
-Requests are plain text terminated by a newline at **115200 baud**. Responses are one JSON object per line. The paths look like HTTP endpoints, but are sent over USB serial; there is no HTTP server in this firmware.
-
-| Request | Purpose |
-| --- | --- |
-| `/bulbs` | List configured bulbs, including disconnected ones |
-| `/bulb/desk_lamp/on` or `/bulb/desk_lamp/off` | Power |
-| `/bulb/desk_lamp/brightness/75` | Brightness, 0–100; use `/off` to switch off |
-| `/bulb/desk_lamp/rgb/r=255&g=80&b=0` | RGB, each channel 0–255 |
-| `/bulb/desk_lamp/temperature/2700` | Temperature, 2000–9000 K |
-| `/bulb/desk_lamp/connect` | Attempt reconnection |
-| `/bulb/desk_lamp/disconnect` | Debug disconnect; monitor may reconnect |
-
-Example responses (address is a placeholder):
-
-```json
-{"bulbs":[{"id":0,"name":"desk_lamp","address":"00:00:00:00:00:00","connected":true}],"count":1}
-{"success":true,"action":"on"}
-{"success":true,"action":"brightness","value":75}
-{"error":"Bulb not found"}
-```
-
-Home Assistant exposes `esp32_bulb_relay.rescan_ports` and `esp32_bulb_relay.refresh_bulbs` for discovery/connectivity refresh. `esp32_bulb_relay.connect_bulb` and `esp32_bulb_relay.disconnect_bulb` take a `bulb_name` field for debugging. These are also available through the integration's configuration menus.
-
-The BLE implementation writes 20-byte, XOR-checksummed Govee frames to characteristic `00010203-0405-0607-0809-0a0b0c0d2b11` in service `00010203-0405-0607-0809-0a0b0c0d1910`.
-
-## Source layout and validation
-
-- `custom_components/esp32_bulb_relay/`: Home Assistant config flow, serial API/queue, coordinator, and light entities.
-- `firmware/govee_controller_serial/`: recovered ESP32 Arduino sketch.
-- `firmware/PROVENANCE.md`: source selection and verification limits.
-
-With the board core and library versions above installed:
-
-```sh
-arduino-cli compile --fqbn esp32:esp32:esp32 firmware/govee_controller_serial
-python3 -m compileall -q custom_components/esp32_bulb_relay
-python3 -m json.tool custom_components/esp32_bulb_relay/manifest.json
-python3 -m json.tool custom_components/esp32_bulb_relay/translations/en.json
-python3 -m json.tool hacs.json
-```
-
-Compilation does not verify radio behavior. End-to-end testing requires a flashed board, H6006 bulbs, and Home Assistant. The recovered sketch has no firmware version/hash query, so its exact match to already-flashed devices has not been established.
-
-## Project history
-
-This is the active ESP32/USB project, formerly named `govee-esp32-blaster`. The integration domain remains `esp32_bulb_relay`, so this repository rename does not rename existing Home Assistant entities. The owner's older [direct-Bluetooth integration fork](https://github.com/ThreeMuskets12/hass-govee_light_ble) is retired in favor of this approach. That fork used Home Assistant's BLE stack directly and is not a dependency of this integration.
-
-This is an independent community project, unaffiliated with Govee.
-
-## License
-
-[MIT](LICENSE).
+[MIT license](LICENSE).
