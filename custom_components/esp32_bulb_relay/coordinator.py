@@ -13,10 +13,23 @@ from .api import (
     ESP32BulbRelayApiError,
     ESP32BulbRelayBulbNotFoundError,
     ESP32BulbRelayCommandError,
+    ESP32BulbRelayOutOfSyncError,
     ESP32BulbRelaySerialApi,
     ESP32BulbRelayTimeoutError,
 )
-from .const import DOMAIN, MAX_MISSED_SCANS, UPDATE_INTERVAL, POLL_TIMEOUT
+from .const import (
+    DOMAIN,
+    MAX_MISSED_SCANS,
+    POLL_TIMEOUT,
+    RECOVERY_BOOT_TIMEOUT,
+    RECOVERY_BOOT_WAIT,
+    RECOVERY_HOLD,
+    RESET_AFTER_MISSED_SCANS,
+    RESET_BACKOFF_INITIAL,
+    RESET_BACKOFF_MAX,
+    RESET_MIN_SILENCE,
+    UPDATE_INTERVAL,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -48,6 +61,9 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._enabled_bulbs: set[str] = set()  # Bulb names user has enabled
         self._port_online: dict[str, bool] = {}  # port -> online status
         self._missed_scans: dict[str, int] = {}  # port -> consecutive failed scans
+        self._resets: dict[str, tuple[int, float]] = {}  # port -> (failures, next allowed at)
+        self._recovery_task: asyncio.Task | None = None  # At most one, across all ports
+        self._closing = False
 
     @property
     def serial_ports(self) -> list[str]:
@@ -105,6 +121,7 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._apis.pop(port, None)
         self._port_online.pop(port, None)
         self._missed_scans.pop(port, None)
+        self._resets.pop(port, None)
 
     def enable_bulb(self, bulb_name: str) -> None:
         """Enable a bulb."""
@@ -127,7 +144,13 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._apis[port] = api
         
         api = self._apis[port]
-        
+
+        # Its own recovery reports back; meanwhile the port must be left alone
+        if api.recovering:
+            _LOGGER.debug("Skipping port %s: recovery in progress", port)
+            self._port_online[port] = False
+            return []
+
         try:
             if not api.is_connected:
                 _LOGGER.debug("Connecting to port %s", port)
@@ -137,7 +160,10 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             bulbs = await api.get_bulbs(timeout=POLL_TIMEOUT)
             self._port_online[port] = True
             self._missed_scans[port] = 0
-            
+            if port in self._resets:
+                del self._resets[port]
+                _LOGGER.info("ESP32 on %s is answering again after a recovery", port)
+
             _LOGGER.info(
                 "Port %s scan successful: %d bulbs found: %s",
                 port,
@@ -147,9 +173,14 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             
             return bulbs
         except ESP32BulbRelayApiError as err:
-            _LOGGER.warning("Failed to scan port %s: %s", port, err)
+            # An outage fails every scan, so only its first gets a warning. For a flood,
+            # the API client's own warning is that one.
+            missed = self._missed_scans.get(port, 0)
+            quiet = missed or isinstance(err, ESP32BulbRelayOutOfSyncError)
+            level = logging.DEBUG if quiet else logging.WARNING
+            _LOGGER.log(level, "Failed to scan port %s: %s", port, err)
             self._port_online[port] = False
-            self._missed_scans[port] = self._missed_scans.get(port, 0) + 1
+            self._missed_scans[port] = missed + 1
             return []
 
     async def async_rescan_all_ports(self) -> dict[str, str]:
@@ -220,8 +251,114 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "Rescan complete: bulb_port_map=%s",
             new_mapping
         )
-        
+
+        self._async_start_recovery()
+
         return new_mapping
+
+    def _troubled_ports(self) -> list[str]:
+        """Return the ports whose boards need a recovery.
+
+        A flood is never a busy-but-healthy board, so it counts at once. Plain silence only
+        counts past the missed-scans threshold and the silence gate.
+        """
+        troubled = []
+        for port in self.serial_ports:
+            api = self._apis.get(port)
+            if api is None:
+                continue
+            if api.out_of_sync or (
+                self._missed_scans.get(port, 0) >= RESET_AFTER_MISSED_SCANS
+                and api.silent_for(RESET_MIN_SILENCE)
+            ):
+                troubled.append(port)
+        return troubled
+
+    def _async_start_recovery(self) -> None:
+        """Start a recovery if a troubled board is due one.
+
+        It runs in the background: it can take a minute per board, healthy ports must keep
+        polling meanwhile, and at startup it must not hold up Home Assistant.
+        """
+        if self._closing or (self._recovery_task and not self._recovery_task.done()):
+            return
+
+        now = asyncio.get_running_loop().time()
+        troubled = self._troubled_ports()
+        # One due board brings the others along: a sibling left looping would drag it back
+        if any(now >= self._resets.get(port, (0, 0.0))[1] for port in troubled):
+            self._recovery_task = self.hass.async_create_background_task(
+                self._async_recover(troubled), name=f"{DOMAIN} coordinated recovery"
+            )
+
+    def _recovery_failed(self, port: str) -> int:
+        """Count a failed recovery of a port and return the seconds until the next."""
+        failures = self._resets.get(port, (0, 0.0))[0]
+        backoff = min(RESET_BACKOFF_INITIAL * 2**failures, RESET_BACKOFF_MAX)
+        self._resets[port] = (failures + 1, asyncio.get_running_loop().time() + backoff)
+        return backoff
+
+    async def _async_hold(self, port: str, api: ESP32BulbRelaySerialApi, min_silence: float) -> bool:
+        """Hold one board in reset and return whether it is held.
+
+        Never raises, or the gather below would move on while a sibling is still going in.
+        """
+        try:
+            return await api.hold_in_reset(min_silence)
+        except Exception as err:
+            _LOGGER.warning(
+                "%s; next try no sooner than %d s", err, self._recovery_failed(port)
+            )
+            return False
+
+    async def _async_recover(self, troubled: list[str]) -> None:
+        """Bring troubled boards back one at a time, so that no two boots overlap.
+
+        Overlapping boots can sag the shared 5 V supply enough to reset each other, and that
+        loop survives resetting one board at a time because the others keep it going. So
+        every troubled board is held in reset first, which also leaves the supply to recover.
+        """
+        apis = {port: self._apis[port] for port in troubled}
+        try:
+            held = await asyncio.gather(
+                *(
+                    self._async_hold(port, api, 0 if api.out_of_sync else RESET_MIN_SILENCE)
+                    for port, api in apis.items()
+                )
+            )
+            held_ports = [port for port, is_held in zip(apis, held) if is_held]
+            if not held_ports:
+                return
+
+            _LOGGER.warning(
+                "Coordinated recovery: holding %s in reset, to release one at a time",
+                ", ".join(held_ports),
+            )
+            await asyncio.sleep(RECOVERY_HOLD)
+
+            still_held = []
+            for port in held_ports:
+                if await apis[port].release_and_wait(RECOVERY_BOOT_TIMEOUT):
+                    self._port_online[port] = True
+                    self._missed_scans[port] = 0
+                    self._resets.pop(port, None)
+                    _LOGGER.info("ESP32 on %s released and answering", port)
+                    continue
+
+                _LOGGER.warning(
+                    "ESP32 on %s did not come up within %d s; next recovery no sooner than %d s",
+                    port, RECOVERY_BOOT_TIMEOUT, self._recovery_failed(port)
+                )
+                if await self._async_hold(port, apis[port], 0):
+                    still_held.append(port)
+
+            # A slow board may only need longer than the timeout, so none waits out the
+            # backoff in reset. They still go one at a time, as together they could loop.
+            for port in still_held:
+                await apis[port].release_hold()
+                await asyncio.sleep(RECOVERY_BOOT_WAIT)
+        finally:
+            await asyncio.gather(*(api.release_hold() for api in apis.values()))
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from all ESP32s and update bulb->port mapping.
@@ -368,7 +505,13 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_shutdown(self) -> None:
         """Shutdown all API connections."""
         _LOGGER.debug("Shutting down coordinator with %d API connections", len(self._apis))
-        
+
+        # Stopping the recovery lets go of any board it holds
+        self._closing = True
+        if self._recovery_task is not None:
+            self._recovery_task.cancel()
+            await asyncio.wait({self._recovery_task}, timeout=5.0)
+
         for port, api in self._apis.items():
             try:
                 _LOGGER.debug("Closing connection to %s", port)

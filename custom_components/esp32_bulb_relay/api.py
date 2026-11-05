@@ -23,7 +23,14 @@ from .const import (
     COMMAND_TIMEOUT,
     DEFAULT_BAUD_RATE,
     DEFAULT_TIMEOUT,
+    JUNK_LINES_MAX_BYTES,
+    JUNK_SAMPLE_BYTES,
     POLL_TIMEOUT,
+    RECOVERY_BOOT_WAIT,
+    RECOVERY_RETRY_GAP,
+    RESYNC_MAX_BYTES,
+    RESYNC_MAX_TIME,
+    RESYNC_QUIET_GAP,
 )
 from .queue import CommandQueue
 
@@ -45,12 +52,58 @@ class ESP32BulbRelayTimeoutError(ESP32BulbRelayConnectionError):
     """The ESP32 did not answer in time; it may still act on the command later."""
 
 
+class ESP32BulbRelayOutOfSyncError(ESP32BulbRelayTimeoutError):
+    """Junk on the stream got in the way. This episode has had its warning already."""
+
+
+class ESP32BulbRelayRecoveringError(ESP32BulbRelayTimeoutError):
+    """The board is held in reset or booting, so nothing may be sent to it yet."""
+
+
 class ESP32BulbRelayCommandError(ESP32BulbRelayApiError):
     """Exception for command failures."""
 
 
 class ESP32BulbRelayBulbNotFoundError(ESP32BulbRelayCommandError):
     """This ESP32 does not have the bulb, so it may have moved to another port."""
+
+
+def _assert_hold(serial_port: Any) -> Any:
+    """Pull EN low through the DevKit auto-reset circuit. Blocks; call from an executor.
+
+    EN is low only with RTS asserted and DTR not; IO0 is low only with DTR asserted and
+    RTS not. DTR goes first, so the lines never pass through the state that pulls IO0 low.
+    """
+    serial_port.dtr = False  # IO0 high
+    serial_port.rts = True  # EN low
+    return serial_port
+
+
+def _hold_through_new_port(device: str, baud_rate: int) -> Any:
+    """Hold a board in reset through its own port. Blocks; call from an executor."""
+    import serial
+
+    # Opening with pyserial's defaults asserts both lines, which does not reset the board
+    serial_port = serial.Serial(device, baud_rate)
+    try:
+        return _assert_hold(serial_port)
+    except OSError:
+        serial_port.close()
+        raise
+
+
+def _release_hold(serial_port: Any, close: bool) -> None:
+    """Let EN rise, so the sketch boots. Blocks; call from an executor.
+
+    Both lines stay deasserted afterwards: that is a run state, and raising them one at
+    a time would pull EN or IO0 low.
+    """
+    try:
+        serial_port.dtr = False  # IO0 high
+        serial_port.rts = False  # EN high: the board boots
+    finally:
+        if close:
+            serial_port.close()
 
 
 class ESP32BulbRelaySerialApi:
@@ -74,10 +127,22 @@ class ESP32BulbRelaySerialApi:
         # A timed-out command's reply may still arrive. The firmware has no request
         # IDs, but it answers in order, so a /bulbs reply proves the stream is in sync.
         self._resync_needed = False
+        self._out_of_sync = False  # Junk seen; discard input until it goes quiet
+        self._junk_logged = False  # This episode of junk has had its one warning
+        self._no_reply_logged = False  # This outage has had its one error
+        self._last_heard: float | None = None  # Last reply, or port open if none since
+        self._recovering = False  # Held or booting: nothing else may use the port
+        self._hold: asyncio.Future | None = None  # Resolves to the port holding EN low
         _LOGGER.debug("API client initialized for port %s", port)
 
     async def connect(self) -> None:
         """Establish serial connection."""
+        self._raise_if_recovering()
+        async with self._lock:
+            await self._connect()
+
+    async def _connect(self) -> None:
+        """Open the port. The API lock must be held."""
         if self._connected:
             _LOGGER.debug("Already connected to %s", self._port)
             return
@@ -103,8 +168,9 @@ class ESP32BulbRelaySerialApi:
                 
                 # Clear any startup messages/garbage from buffer
                 await self._clear_buffer()
+                self._last_heard = asyncio.get_running_loop().time()
                 _LOGGER.info("Connection to %s ready", self._port)
-            
+
         except asyncio.TimeoutError:
             self._connected = False
             _LOGGER.error("Timeout while connecting to %s", self._port)
@@ -127,10 +193,11 @@ class ESP32BulbRelaySerialApi:
             return
         
         total_cleared = 0
+        sample = b""
         start_time = asyncio.get_event_loop().time()
         max_time = 2.0  # Maximum 2 seconds total for buffer clearing
         max_bytes = 65536  # Maximum 64KB to clear
-        
+
         _LOGGER.debug("Clearing buffer on %s", self._port)
         
         try:
@@ -142,16 +209,15 @@ class ESP32BulbRelaySerialApi:
                         "Buffer clear time limit (%.1fs) reached on %s, cleared %d bytes",
                         max_time, self._port, total_cleared
                     )
+                    # At 115200 baud a flood reaches this before the bytes limit
+                    self._mark_out_of_sync(f"no pause in {max_time:.0f}s of clearing", sample)
                     break
-                
+
                 # Check bytes limit
                 if total_cleared > max_bytes:
-                    _LOGGER.warning(
-                        "Buffer clear bytes limit (%d) reached on %s - too much data",
-                        max_bytes, self._port
-                    )
+                    self._mark_out_of_sync(f"over {max_bytes} bytes to clear", sample)
                     break
-                
+
                 try:
                     # Use wait_for which is more reliable than timeout context
                     data = await asyncio.wait_for(
@@ -162,6 +228,8 @@ class ESP32BulbRelaySerialApi:
                         _LOGGER.debug("No more data to clear on %s", self._port)
                         break
                     total_cleared += len(data)
+                    if len(sample) < JUNK_SAMPLE_BYTES:
+                        sample += data
                 except asyncio.TimeoutError:
                     # No data available - buffer is clear
                     _LOGGER.debug("Buffer clear complete on %s (timeout, %d bytes cleared)", 
@@ -177,15 +245,64 @@ class ESP32BulbRelaySerialApi:
         if total_cleared > 0:
             _LOGGER.info("Cleared %d bytes from buffer on %s", total_cleared, self._port)
 
+    def _mark_out_of_sync(self, reason: str, junk: bytes) -> None:
+        """Note that the stream can't be trusted, warning once per episode."""
+        self._out_of_sync = True
+        if self._junk_logged:
+            _LOGGER.debug("Stream from %s still out of sync: %s", self._port, reason)
+            return
+        self._junk_logged = True
+        _LOGGER.warning(
+            "Serial stream from %s is out of sync (%s), discarding until it goes quiet. "
+            "First bytes: %r",
+            self._port, reason, junk[:JUNK_SAMPLE_BYTES]
+        )
+
+    async def _resync_stream(self) -> None:
+        """Discard input until a quiet gap, within the time and bytes limits."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + RESYNC_MAX_TIME
+        discarded = 0
+        sample = b""
+
+        while loop.time() < deadline and discarded < RESYNC_MAX_BYTES:
+            try:
+                data = await asyncio.wait_for(
+                    self._reader.read(4096),
+                    timeout=RESYNC_QUIET_GAP
+                )
+            except asyncio.TimeoutError:
+                self._out_of_sync = False
+                _LOGGER.debug("Stream from %s quiet after %d bytes", self._port, discarded)
+                return
+            if not data:
+                break
+            discarded += len(data)
+            if len(sample) < JUNK_SAMPLE_BYTES:
+                sample += data
+
+        # After a reset the episode is new, and junk too slow for the clear starts here
+        self._mark_out_of_sync(f"no pause in {discarded} bytes", sample)
+        raise ESP32BulbRelayOutOfSyncError(
+            f"{self._port} still out of sync after discarding {discarded} bytes"
+        )
+
     async def close(self) -> None:
         """Close the serial connection."""
         _LOGGER.debug("Closing connection to %s", self._port)
-        
+
+        await self.release_hold()
+
         try:
             await self._command_queue.stop()
         except Exception as err:
             _LOGGER.debug("Error stopping command queue for %s: %s", self._port, err)
-        
+
+        await self._close_transport()
+        _LOGGER.info("Disconnected from %s", self._port)
+
+    async def _close_transport(self) -> None:
+        """Close the port but leave the command queue running."""
         if self._writer:
             try:
                 self._writer.close()
@@ -202,13 +319,127 @@ class ESP32BulbRelaySerialApi:
         self._reader = None
         self._writer = None
         self._connected = False
-        _LOGGER.info("Disconnected from %s", self._port)
+
+    def _raise_if_recovering(self) -> None:
+        """Fail fast: a held board can't answer, and a booting one must not be disturbed."""
+        if self._recovering:
+            raise ESP32BulbRelayRecoveringError(f"{self._port} is being recovered")
+
+    def silent_for(self, seconds: float) -> bool:
+        """Return whether nothing has been heard from the board for this long."""
+        return (
+            self._last_heard is None
+            or asyncio.get_running_loop().time() - self._last_heard >= seconds
+        )
+
+    async def hold_in_reset(self, min_silence: float = 0) -> bool:
+        """Hold EN low, so the board draws no boot current, until it is released.
+
+        Every other use of the port fails fast until release_and_wait() succeeds or
+        release_hold() is called, and one of those must follow. Returns False, leaving the
+        board alone, if it was heard in the last min_silence seconds.
+        """
+        loop = asyncio.get_running_loop()
+
+        # Set before queueing for the lock, which is FIFO, so nothing can follow this in
+        self._recovering = True
+
+        async with self._lock:
+            if not self.silent_for(min_silence):
+                _LOGGER.debug("Not holding %s: it answered recently", self._port)
+                self._recovering = False
+                return False
+
+            serial_port = self._writer.get_extra_info("serial") if self._writer else None
+            if serial_port is not None and serial_port.is_open:
+                self._hold = loop.run_in_executor(None, _assert_hold, serial_port)
+            else:
+                await self._close_transport()
+                self._hold = loop.run_in_executor(
+                    None, _hold_through_new_port, self._port, self._baud_rate
+                )
+
+            # If this is cancelled the lines may yet change, so the release waits for the job
+            try:
+                await asyncio.shield(self._hold)
+            except OSError as err:  # Includes serial.SerialException
+                self._hold = None
+                self._recovering = False
+                raise ESP32BulbRelayConnectionError(
+                    f"Could not hold {self._port} in reset: {err}"
+                ) from err
+            return True
+
+    async def _let_go(self) -> None:
+        """Let EN rise if it is held, and see that through even if cancelled."""
+        job, self._hold = self._hold, None
+        if job is None:
+            return
+
+        async def release() -> None:
+            serial_port = await job
+            transport = self._writer.get_extra_info("serial") if self._writer else None
+            await asyncio.get_running_loop().run_in_executor(
+                None, _release_hold, serial_port, serial_port is not transport
+            )
+
+        release_task = asyncio.ensure_future(release())
+        await asyncio.shield(release_task)
+
+    async def release_hold(self) -> None:
+        """End the recovery of this board, letting it run. Safe to call at any time."""
+        try:
+            await self._let_go()
+        except OSError as err:
+            _LOGGER.debug("Error releasing %s: %s", self._port, err)
+        finally:
+            self._recovering = False
+
+    async def release_and_wait(self, timeout: float) -> bool:
+        """Release the held board and wait for a quiet line and an answer to /bulbs.
+
+        The API lock is held throughout, so nothing else reaches the booting board. If this
+        returns False the board is running but unproven, and the recovery is not over:
+        hold it again, or end it with release_hold().
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+
+        async with self._lock:
+            try:
+                await self._let_go()
+            except OSError as err:
+                _LOGGER.debug("Could not release %s: %s", self._port, err)
+                return False
+
+            # A reset drops whatever the board was working on
+            self._resync_needed = True
+
+            await asyncio.sleep(RECOVERY_BOOT_WAIT)
+
+            while loop.time() < deadline:
+                try:
+                    if not self._connected:
+                        await self._connect()
+                    await self._resync_stream()
+                    await self._exchange(CMD_BULBS, min(POLL_TIMEOUT, deadline - loop.time()))
+                    self._recovering = False
+                    return True
+                except ESP32BulbRelayConnectionError as err:
+                    _LOGGER.debug("%s not up yet: %s", self._port, err)
+                except OSError as err:  # The transport died with the board
+                    _LOGGER.debug("%s not up yet: %s", self._port, err)
+                    await self._close_transport()
+                await asyncio.sleep(RECOVERY_RETRY_GAP)
+
+        return False
 
     async def _read_line_safe(self, timeout: float = 5.0) -> bytes | None:
-        """Read a line with timeout, handling errors gracefully.
-        
+        """Read a newline-terminated line, or None if there isn't one in time.
+
         Uses individual timeouts per read operation to prevent any single
-        read from blocking indefinitely.
+        read from blocking indefinitely. Anything unterminated is discarded, because
+        it may be a fragment of junk.
         """
         if self._reader is None:
             return None
@@ -221,10 +452,10 @@ class ESP32BulbRelaySerialApi:
                 # Check overall timeout
                 elapsed = asyncio.get_event_loop().time() - start_time
                 if elapsed > timeout:
-                    _LOGGER.debug("Read timeout on %s after %.1fs (got %d bytes)", 
+                    _LOGGER.debug("Read timeout on %s after %.1fs (got %d bytes)",
                                  self._port, elapsed, len(line))
-                    return line if line else None
-                
+                    return None
+
                 # Remaining time for this read
                 remaining = max(0.1, timeout - elapsed)
                 
@@ -235,12 +466,11 @@ class ESP32BulbRelaySerialApi:
                         timeout=min(remaining, 0.5)  # Max 0.5s per byte
                     )
                 except asyncio.TimeoutError:
-                    # Return what we have so far
-                    return line if line else None
-                
+                    return None
+
                 if not byte:
-                    return line if line else None
-                    
+                    return None
+
                 if byte == b'\n':
                     return line
                 if byte == b'\r':
@@ -250,12 +480,12 @@ class ESP32BulbRelaySerialApi:
                 
                 # Limit line length to prevent memory issues
                 if len(line) > 8192:
-                    _LOGGER.warning("Line too long on %s, truncating", self._port)
-                    return line
-                    
+                    self._mark_out_of_sync("line too long", line)
+                    return None
+
         except Exception as err:
             _LOGGER.debug("Read error on %s: %s", self._port, err)
-            return line if line else None
+            return None
 
     async def _send_command(self, command: str, timeout: float | None = None) -> dict[str, Any]:
         """Send a command and wait for JSON response."""
@@ -263,21 +493,27 @@ class ESP32BulbRelaySerialApi:
             timeout = self._timeout
             
         _LOGGER.debug("_send_command called: %s on %s (timeout=%s)", command, self._port, timeout)
-        
-        if not self._connected:
-            _LOGGER.debug("Not connected, attempting to connect to %s", self._port)
-            await self.connect()
-        
-        if self._writer is None or self._reader is None:
-            raise ESP32BulbRelayConnectionError("Not connected to ESP32")
-        
+
+        self._raise_if_recovering()
+
         async with self._lock:
             _LOGGER.debug("Acquired lock for %s", self._port)
-            
+
+            if not self._connected:
+                _LOGGER.debug("Not connected, attempting to connect to %s", self._port)
+                await self._connect()
+
+            if self._writer is None or self._reader is None:
+                raise ESP32BulbRelayConnectionError("Not connected to ESP32")
+
             try:
                 # Clear any pending data
                 await self._clear_buffer()
-                
+
+                # Nothing is written into a stream that hasn't gone quiet
+                if self._out_of_sync:
+                    await self._resync_stream()
+
                 # Don't queue a command behind one the ESP32 hasn't finished: it would
                 # run late, and its reply couldn't be told from the earlier one's.
                 if self._resync_needed and command != CMD_BULBS:
@@ -316,12 +552,19 @@ class ESP32BulbRelaySerialApi:
         start_time = asyncio.get_event_loop().time()
         attempts = 0
         max_attempts = 100
-        
+        junk_bytes = 0
+
         while attempts < max_attempts:
             # Check overall timeout
             elapsed = asyncio.get_event_loop().time() - start_time
             if elapsed > timeout:
-                _LOGGER.error("Overall timeout after %.1fs on %s", elapsed, self._port)
+                # A silent board fails every scan, so an outage gets one error
+                quiet = self._no_reply_logged or self._recovering
+                self._no_reply_logged = True
+                _LOGGER.log(
+                    logging.DEBUG if quiet else logging.ERROR,
+                    "Overall timeout after %.1fs on %s", elapsed, self._port
+                )
                 raise ESP32BulbRelayTimeoutError(
                     f"Timeout waiting for response from {self._port}"
                 )
@@ -333,14 +576,26 @@ class ESP32BulbRelaySerialApi:
                          attempts, self._port, timeout - elapsed)
             
             line = await self._read_line_safe(timeout=remaining_timeout)
-            
+
+            # The reply, if any, is lost in the junk. The board may still act on the command.
+            if self._out_of_sync:
+                await self._resync_stream()
+                raise ESP32BulbRelayOutOfSyncError(
+                    f"Reply from {self._port} lost in junk on the stream"
+                )
+
             if line is None:
                 _LOGGER.debug("No data received on attempt %d from %s", attempts, self._port)
                 continue
-            
-            # Try to decode as UTF-8
+
+            junk_bytes += len(line)
+            if junk_bytes > JUNK_LINES_MAX_BYTES:
+                self._mark_out_of_sync(f"{junk_bytes} bytes of lines but no reply", line)
+                continue
+
+            # Try to decode as UTF-8. Dropping bad bytes could turn junk into a valid reply.
             try:
-                line_str = line.decode('utf-8', errors='ignore').strip()
+                line_str = line.decode('utf-8').strip()
             except Exception as decode_err:
                 _LOGGER.debug("Decode error on %s: %s", self._port, decode_err)
                 continue
@@ -366,7 +621,13 @@ class ESP32BulbRelaySerialApi:
             except json.JSONDecodeError as json_err:
                 _LOGGER.debug("JSON parse error on %s: %s", self._port, json_err)
                 continue
-            
+
+            # Even a late reply proves the board is alive and the stream is readable
+            self._last_heard = asyncio.get_event_loop().time()
+            self._junk_logged = False
+            self._no_reply_logged = False
+            junk_bytes = 0
+
             # A late reply to a timed-out command can't answer this one
             is_bulb_list = isinstance(result, dict) and "bulbs" in result
             if is_bulb_list != (command == CMD_BULBS):
@@ -378,8 +639,10 @@ class ESP32BulbRelaySerialApi:
             _LOGGER.info("Valid JSON response from %s: %s", self._port, result)
             return result
         
-        _LOGGER.error("No valid JSON after %d attempts on %s", max_attempts, self._port)
-        raise ESP32BulbRelayConnectionError(
+        # The timeout comes first unless lines keep arriving, and a reset loop's are short
+        self._mark_out_of_sync(f"{max_attempts} attempts but no reply", line or b"")
+        await self._resync_stream()
+        raise ESP32BulbRelayOutOfSyncError(
             f"No valid JSON response after {max_attempts} attempts from {self._port}"
         )
 
@@ -412,6 +675,16 @@ class ESP32BulbRelaySerialApi:
     def is_connected(self) -> bool:
         """Return connection status."""
         return self._connected
+
+    @property
+    def out_of_sync(self) -> bool:
+        """Return True if the stream never went quiet: a flood, not a busy board."""
+        return self._out_of_sync
+
+    @property
+    def recovering(self) -> bool:
+        """Return True while the board is held in reset or booting from a recovery."""
+        return self._recovering
 
     @property
     def pending_commands(self) -> int:

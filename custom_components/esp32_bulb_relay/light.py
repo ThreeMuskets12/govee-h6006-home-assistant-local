@@ -2,19 +2,23 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
+    ATTR_COLOR_MODE,
     ATTR_COLOR_TEMP_KELVIN,
     ATTR_RGB_COLOR,
     ColorMode,
     LightEntity,
 )
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import STATE_OFF, STATE_ON
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoredExtraData, RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .api import ESP32BulbRelayApiError
@@ -28,6 +32,8 @@ from .const import (
 from .coordinator import ESP32BulbRelayCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+EXTRA_IS_ON = "is_on"  # The other restore data keys match the state attributes
 
 
 async def async_setup_entry(
@@ -56,7 +62,9 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class ESP32BulbRelayLight(CoordinatorEntity[ESP32BulbRelayCoordinator], LightEntity):
+class ESP32BulbRelayLight(
+    CoordinatorEntity[ESP32BulbRelayCoordinator], LightEntity, RestoreEntity
+):
     """Representation of an ESP32 Bulb Relay light.
     
     This entity is identified by bulb name only, not by port.
@@ -99,6 +107,50 @@ class ESP32BulbRelayLight(CoordinatorEntity[ESP32BulbRelayCoordinator], LightEnt
         self._attr_available = True
         
         _LOGGER.debug("Created light entity for bulb '%s'", bulb_name)
+
+    @property
+    def extra_restore_state_data(self) -> RestoredExtraData:
+        """Keep the last known state, which unavailable and off states don't show."""
+        return RestoredExtraData(
+            {
+                EXTRA_IS_ON: self._attr_is_on,
+                ATTR_BRIGHTNESS: self._attr_brightness,
+                ATTR_RGB_COLOR: list(self._attr_rgb_color),
+                ATTR_COLOR_TEMP_KELVIN: self._attr_color_temp_kelvin,
+                ATTR_COLOR_MODE: self._attr_color_mode.value,
+            }
+        )
+
+    def _restore(self, is_on: bool, values: Mapping[str, Any]) -> None:
+        """Apply stored values, keeping the defaults for any that are missing."""
+        self._attr_is_on = is_on
+
+        if (brightness := values.get(ATTR_BRIGHTNESS)) is not None:
+            self._attr_brightness = brightness
+        if (rgb_color := values.get(ATTR_RGB_COLOR)) is not None:
+            self._attr_rgb_color = tuple(rgb_color)
+        if (color_temp := values.get(ATTR_COLOR_TEMP_KELVIN)) is not None:
+            self._attr_color_temp_kelvin = color_temp
+        if values.get(ATTR_COLOR_MODE) in self._attr_supported_color_modes:
+            self._attr_color_mode = ColorMode(values[ATTR_COLOR_MODE])
+
+        _LOGGER.debug("Restored '%s' as %s", self._bulb_name, STATE_ON if is_on else STATE_OFF)
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the last state: mains-powered bulbs keep it across HA restarts."""
+        await super().async_added_to_hass()
+
+        extra_data = await self.async_get_last_extra_data()
+        values = extra_data.as_dict() if extra_data is not None else {}
+        if isinstance(is_on := values.get(EXTRA_IS_ON), bool):
+            self._restore(is_on, values)
+            return
+
+        last_state = await self.async_get_last_state()
+        # "unavailable" and "unknown" say nothing about the bulb. HA also clears the
+        # attributes while a light is off, which _restore() allows for.
+        if last_state is not None and last_state.state in (STATE_ON, STATE_OFF):
+            self._restore(last_state.state == STATE_ON, last_state.attributes)
 
     @property
     def available(self) -> bool:
