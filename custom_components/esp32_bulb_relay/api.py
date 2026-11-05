@@ -6,7 +6,10 @@ import json
 import logging
 from typing import Any
 
-import serial_asyncio
+try:
+    import serial_asyncio_fast as serial_asyncio  # HA 2026.10+ no longer ships pyserial-asyncio
+except ImportError:  # pragma: no cover
+    import serial_asyncio
 
 from .const import (
     CMD_BULB_BRIGHTNESS,
