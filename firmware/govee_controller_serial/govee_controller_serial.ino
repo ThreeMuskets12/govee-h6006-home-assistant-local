@@ -76,7 +76,7 @@ struct GoveeBulb {
 };
 
 #define RECONNECT_FAST_ATTEMPTS 3      // Number of quick reconnect attempts before backing off
-#define RECONNECT_SLOW_INTERVAL 60000  // 1 minute between reconnect attempts in slow mode
+#define RECONNECT_SLOW_INTERVAL 20000  // 20 seconds between reconnect attempts in slow mode
 
 // Globals
 NimBLEScan* pBLEScan;
@@ -95,8 +95,11 @@ bool scanComplete = false;
 bool setupComplete = false;
 Preferences preferences;
 
-// Mutex for BLE operations
+// Guards the bulb link state and GATT writes. Never held across a blocking BLE call,
+// so writes to healthy bulbs don't wait on a connection attempt to a missing one.
 SemaphoreHandle_t bleMutex;
+// Serializes connection attempts: NimBLE runs only one at a time.
+SemaphoreHandle_t connectMutex;
 
 // ========== NimBLE Scan Callback ==========
 
@@ -343,7 +346,7 @@ void scanBLEDevices() {
 // ========== Bulb Connection ==========
 
 bool connectToBulb(int bulbIdx) {
-    if(xSemaphoreTake(bleMutex, pdMS_TO_TICKS(10000)) != pdTRUE) {
+    if(xSemaphoreTake(connectMutex, pdMS_TO_TICKS(CONNECT_TIMEOUT)) != pdTRUE) {
         DEBUG_PRINTLN("[BLE] Could not acquire mutex for connection");
         return false;
     }
@@ -360,6 +363,9 @@ bool connectToBulb(int bulbIdx) {
     DEBUG_PRINT(bulbs[bulbIdx].reconnectAttempts);
     DEBUG_PRINT("...");
     
+    xSemaphoreTake(bleMutex, portMAX_DELAY);
+    bulbs[bulbIdx].connected = false;
+    bulbs[bulbIdx].writeChar = nullptr;
     if(bulbs[bulbIdx].client != nullptr) {
         if(bulbs[bulbIdx].client->isConnected()) {
             bulbs[bulbIdx].client->disconnect();
@@ -367,11 +373,18 @@ bool connectToBulb(int bulbIdx) {
         NimBLEDevice::deleteClient(bulbs[bulbIdx].client);
         bulbs[bulbIdx].client = nullptr;
     }
-    bulbs[bulbIdx].writeChar = nullptr;
-    bulbs[bulbIdx].connected = false;
+    xSemaphoreGive(bleMutex);
     
+    // Returns nullptr at NimBLE's connection limit, including while a client that
+    // was just disconnected above is still waiting to be deleted
     bulbs[bulbIdx].client = NimBLEDevice::createClient();
+    if(bulbs[bulbIdx].client == nullptr) {
+        DEBUG_PRINTLN(" FAILED - No free client");
+        xSemaphoreGive(connectMutex);
+        return false;
+    }
     bulbs[bulbIdx].client->setClientCallbacks(&clientCallbacks, false);
+    bulbs[bulbIdx].client->setConnectTimeout(CONNECT_TIMEOUT);
     
     if(!bulbs[bulbIdx].client->connect(bulbs[bulbIdx].address, false)) {
         DEBUG_PRINTLN(" FAILED - Could not connect");
@@ -383,12 +396,12 @@ bool connectToBulb(int bulbIdx) {
             if(!bulbs[bulbIdx].slowReconnectMode) {
                 DEBUG_PRINT("[BLE] Bulb ");
                 DEBUG_PRINT(bulbIdx);
-                DEBUG_PRINTLN(" entering slow reconnect mode (1 attempt/minute)");
+                DEBUG_PRINTLN(" entering slow reconnect mode");
                 bulbs[bulbIdx].slowReconnectMode = true;
             }
         }
         
-        xSemaphoreGive(bleMutex);
+        xSemaphoreGive(connectMutex);
         return false;
     }
     
@@ -403,12 +416,12 @@ bool connectToBulb(int bulbIdx) {
             if(!bulbs[bulbIdx].slowReconnectMode) {
                 DEBUG_PRINT("[BLE] Bulb ");
                 DEBUG_PRINT(bulbIdx);
-                DEBUG_PRINTLN(" entering slow reconnect mode (1 attempt/minute)");
+                DEBUG_PRINTLN(" entering slow reconnect mode");
                 bulbs[bulbIdx].slowReconnectMode = true;
             }
         }
         
-        xSemaphoreGive(bleMutex);
+        xSemaphoreGive(connectMutex);
         return false;
     }
     
@@ -423,18 +436,21 @@ bool connectToBulb(int bulbIdx) {
             if(!bulbs[bulbIdx].slowReconnectMode) {
                 DEBUG_PRINT("[BLE] Bulb ");
                 DEBUG_PRINT(bulbIdx);
-                DEBUG_PRINTLN(" entering slow reconnect mode (1 attempt/minute)");
+                DEBUG_PRINTLN(" entering slow reconnect mode");
                 bulbs[bulbIdx].slowReconnectMode = true;
             }
         }
         
-        xSemaphoreGive(bleMutex);
+        xSemaphoreGive(connectMutex);
         return false;
     }
     
-    bulbs[bulbIdx].connected = true;
     bulbs[bulbIdx].lastKeepAlive = millis();
     bulbs[bulbIdx].consecutiveFailures = 0;
+    
+    xSemaphoreTake(bleMutex, portMAX_DELAY);
+    bulbs[bulbIdx].connected = true;
+    xSemaphoreGive(bleMutex);
     
     // Reset reconnect tracking on successful connection
     bulbs[bulbIdx].reconnectAttempts = 0;
@@ -442,7 +458,7 @@ bool connectToBulb(int bulbIdx) {
     
     DEBUG_PRINTLN(" SUCCESS!");
     
-    xSemaphoreGive(bleMutex);
+    xSemaphoreGive(connectMutex);
     return true;
 }
 
@@ -524,44 +540,26 @@ bool writeWithRetry(int idx, uint8_t* packet, const char* cmdName) {
         return false;
     }
     
-    // If bulb is in slow reconnect mode, only try once (don't do rapid retries)
-    int maxAttempts = bulbs[idx].slowReconnectMode ? 1 : MAX_RETRY_ATTEMPTS;
-    
-    for(int attempt = 0; attempt < maxAttempts; attempt++) {
+    for(int attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt++) {
+        if(xSemaphoreTake(bleMutex, pdMS_TO_TICKS(WRITE_TIMEOUT)) != pdTRUE) {
+            DEBUG_PRINTLN("[BLE] Could not acquire mutex for write");
+            continue;
+        }
+        
+        // onDisconnect clears writeChar without bleMutex, so read it once
+        NimBLERemoteCharacteristic* writeChar = bulbs[idx].writeChar;
+        
+        // Reconnecting is left to BLEMonitor: this runs in loop(), which has to keep
+        // serving the other bulbs
         if(!bulbs[idx].connected || bulbs[idx].client == nullptr || 
-           !bulbs[idx].client->isConnected() || bulbs[idx].writeChar == nullptr) {
-            
-            // If in slow reconnect mode, check if enough time has passed
-            if(bulbs[idx].slowReconnectMode) {
-                unsigned long now = millis();
-                if(now - bulbs[idx].lastReconnectAttempt < RECONNECT_SLOW_INTERVAL) {
-                    DEBUG_PRINT("[");
-                    DEBUG_PRINT(cmdName);
-                    DEBUG_PRINT("] Bulb ");
-                    DEBUG_PRINT(idx);
-                    DEBUG_PRINTLN(" in slow reconnect mode, skipping rapid retry");
-                    return false;
-                }
-            }
-            
+           !bulbs[idx].client->isConnected() || writeChar == nullptr) {
+            xSemaphoreGive(bleMutex);
             DEBUG_PRINT("[");
             DEBUG_PRINT(cmdName);
             DEBUG_PRINT("] Bulb ");
             DEBUG_PRINT(idx);
-            DEBUG_PRINT(" not connected, reconnecting (attempt ");
-            DEBUG_PRINT(attempt + 1);
-            DEBUG_PRINTLN(")...");
-            
-            if(!connectToBulb(idx)) {
-                DEBUG_PRINTLN("Reconnection failed, will retry...");
-                delay(500);
-                continue;
-            }
-        }
-        
-        if(xSemaphoreTake(bleMutex, pdMS_TO_TICKS(WRITE_TIMEOUT)) != pdTRUE) {
-            DEBUG_PRINTLN("[BLE] Could not acquire mutex for write");
-            continue;
+            DEBUG_PRINTLN(" not connected");
+            return false;
         }
         
         DEBUG_PRINT("[");
@@ -570,7 +568,7 @@ bool writeWithRetry(int idx, uint8_t* packet, const char* cmdName) {
         DEBUG_PRINT(idx);
         DEBUG_PRINT("...");
         
-        bool success = bulbs[idx].writeChar->writeValue(packet, GOVEE_PACKET_SIZE, false);
+        bool success = writeChar->writeValue(packet, GOVEE_PACKET_SIZE, false);
         
         xSemaphoreGive(bleMutex);
         
@@ -581,7 +579,6 @@ bool writeWithRetry(int idx, uint8_t* packet, const char* cmdName) {
         } else {
             DEBUG_PRINTLN(" FAILED!");
             bulbs[idx].consecutiveFailures++;
-            bulbs[idx].connected = false;
             delay(200);
         }
     }
@@ -589,12 +586,11 @@ bool writeWithRetry(int idx, uint8_t* packet, const char* cmdName) {
     DEBUG_PRINT("[");
     DEBUG_PRINT(cmdName);
     DEBUG_PRINTLN("] All retry attempts exhausted");
+    bulbs[idx].connected = false;  // BLEMonitor rebuilds the link
     return false;
 }
 
 void sendKeepAlive(int idx) {
-    if(!bulbs[idx].connected || bulbs[idx].writeChar == nullptr) return;
-    
     uint8_t packet[GOVEE_PACKET_SIZE];
     govee_build_keepalive_packet(packet);
     
@@ -602,7 +598,14 @@ void sendKeepAlive(int idx) {
         return;
     }
     
-    bool success = bulbs[idx].writeChar->writeValue(packet, GOVEE_PACKET_SIZE, false);
+    // onDisconnect clears writeChar without bleMutex, so read it once
+    NimBLERemoteCharacteristic* writeChar = bulbs[idx].writeChar;
+    if(!bulbs[idx].connected || writeChar == nullptr) {
+        xSemaphoreGive(bleMutex);
+        return;
+    }
+    
+    bool success = writeChar->writeValue(packet, GOVEE_PACKET_SIZE, false);
     
     xSemaphoreGive(bleMutex);
     
@@ -666,7 +669,11 @@ void disconnectBulb(int idx) {
     DEBUG_PRINT(idx);
     DEBUG_PRINTLN("...");
     
-    if(xSemaphoreTake(bleMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+    // connectMutex first: a connection attempt may be using this bulb's client
+    if(xSemaphoreTake(connectMutex, pdMS_TO_TICKS(CONNECT_TIMEOUT)) == pdTRUE) {
+        xSemaphoreTake(bleMutex, portMAX_DELAY);
+        bulbs[idx].connected = false;
+        bulbs[idx].writeChar = nullptr;
         if(bulbs[idx].client != nullptr) {
             if(bulbs[idx].client->isConnected()) {
                 bulbs[idx].client->disconnect();
@@ -674,9 +681,8 @@ void disconnectBulb(int idx) {
             NimBLEDevice::deleteClient(bulbs[idx].client);
             bulbs[idx].client = nullptr;
         }
-        bulbs[idx].writeChar = nullptr;
-        bulbs[idx].connected = false;
         xSemaphoreGive(bleMutex);
+        xSemaphoreGive(connectMutex);
     }
     
     DEBUG_PRINTLN("[DISCONNECT] Done");
@@ -884,16 +890,17 @@ void checkConnectionsTask(void* parameter) {
     for(;;) {
         vTaskDelay(pdMS_TO_TICKS(5000));  // Check every 5 seconds
         
-        unsigned long now = millis();
-        
         for(int i = 0; i < numBulbs; i++) {
+            // Connection attempts take seconds, so take the time per bulb
+            unsigned long now = millis();
+            
             // Check if bulb needs reconnection
             if(!bulbs[i].connected || bulbs[i].client == nullptr || 
                (bulbs[i].client != nullptr && !bulbs[i].client->isConnected())) {
                 
                 // Check if we're in slow reconnect mode
                 if(bulbs[i].slowReconnectMode) {
-                    // Only attempt reconnect once per minute in slow mode
+                    // Only attempt reconnect once per RECONNECT_SLOW_INTERVAL in slow mode
                     if(now - bulbs[i].lastReconnectAttempt < RECONNECT_SLOW_INTERVAL) {
                         continue;  // Skip this bulb, not time yet
                     }
@@ -926,7 +933,8 @@ void setup() {
     DEBUG_PRINTLN("========================================");
     
     bleMutex = xSemaphoreCreateMutex();
-    if(bleMutex == NULL) {
+    connectMutex = xSemaphoreCreateMutex();
+    if(bleMutex == NULL || connectMutex == NULL) {
         DEBUG_PRINTLN("ERROR: Failed to create mutex!");
         while(1) delay(1000);
     }
@@ -954,11 +962,15 @@ void setup() {
     bool runSetup = true;
     
     if(hasConfig) {
-        DEBUG_PRINTLN("\n[PROMPT] Saved config found. Press 's' within 5 seconds to run setup...");
-        
-        unsigned long startTime = millis();
         bool userResponded = false;
-        
+
+        // Debug builds only: the integration's /bulbs poll contains an 's', which must
+        // not be able to drop a production board into setup
+#if DEBUG
+        DEBUG_PRINTLN("\n[PROMPT] Saved config found. Press 's' within 5 seconds to run setup...");
+
+        unsigned long startTime = millis();
+
         while(millis() - startTime < 5000) {
             if(Serial.available()) {
                 char c = Serial.read();
@@ -970,7 +982,8 @@ void setup() {
             }
             delay(100);
         }
-        
+#endif
+
         if(!userResponded) {
             DEBUG_PRINTLN("[AUTO] Using saved configuration");
             runSetup = false;

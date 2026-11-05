@@ -13,7 +13,7 @@ These versions are the locally available build baseline, not a requirement to up
 
 ## 1. Flash and provision each ESP32
 
-The firmware is [firmware/govee_controller_serial/govee_controller_serial.ino](../firmware/govee_controller_serial/govee_controller_serial.ino). It is an Arduino sketch, not a PlatformIO project. It is preserved unchanged from the recovered source; see [firmware provenance](../firmware/PROVENANCE.md).
+The firmware is [firmware/govee_controller_serial/govee_controller_serial.ino](../firmware/govee_controller_serial/govee_controller_serial.ino). It is an Arduino sketch, not a PlatformIO project. It started as the recovered source and has since had reconnect fixes; see [firmware provenance](../firmware/PROVENANCE.md).
 
 **First-time setup needs `DEBUG=1`.** The recovered production sketch sets `DEBUG=0`, which also hides the interactive provisioning prompts. Flashing that default onto a blank board leaves it waiting silently for bulb selection.
 
@@ -25,7 +25,7 @@ The firmware is [firmware/govee_controller_serial/govee_controller_serial.ino](.
 6. Repeat for up to **three bulbs** with the default library. Use simple names such as `desk_lamp` or `ceiling_1`, containing only letters, digits, underscores, or hyphens. Names must be unique across **all** ESP32s, including case-insensitive comparisons. Names are routing/entity identifiers; quotes, slashes, and other special characters are not safely escaped by this firmware.
 7. Send `-1` to finish. At least one successfully connected bulb is required. Wait for setup to complete so the firmware saves the names and addresses in NVS.
 8. Send `/bulbs`. Expect one JSON line listing the configured bulbs and their connection status.
-9. Change `DEBUG` back to **0** and upload again, **without erasing flash or changing the partition scheme**. Saved bulb assignments survive a normal upload. Let the five-second setup window expire without sending anything; the ESP32 reconnects automatically.
+9. Change `DEBUG` back to **0** and upload again, **without erasing flash or changing the partition scheme**. Saved bulb assignments survive a normal upload. With saved assignments, a `DEBUG=0` build skips the five-second setup window, so serial traffic cannot trigger setup, and the ESP32 reconnects automatically.
 10. Check `/bulbs` again, close Serial Monitor, and connect the board to the Home Assistant host. Only one program should own its serial port at a time.
 
 To change assignments later, use the debug build, open Serial Monitor, reset the board, and send `s` during the five-second saved-configuration prompt. This rebuilds that board's bulb list; finish with `-1`, then return to `DEBUG=0`. Preserve existing names if you want to preserve Home Assistant routing and entities.
@@ -77,10 +77,11 @@ Include every configured port and ensure the Home Assistant process has serial-d
 | Blank first-time Serial Monitor; `/bulbs` never responds | Provision with `DEBUG=1`, 115200 baud, and Newline. Reset after opening the monitor. A blank board waits for interactive setup. |
 | Bulb missing from scan | Keep it powered and nearby, close the phone app, and reset/re-run setup to scan again. The scan only stores the first 50 results. |
 | Fourth bulb cannot connect | Default NimBLE builds allow three connections. Use another ESP32 rather than selecting a fourth with this build. |
+| Old bulb still listed as a device | Open the device in Home Assistant and delete it. This works once every board is answering and none of them reports that bulb. |
 | Bulbs unavailable just after reboot | Allow the startup/setup window and BLE reconnections to finish; then use **Rescan All Ports**. |
 | USB port missing | Check the data cable, power, USB passthrough/permissions, and whether the path changed. Add any new path in Configure. |
-| Commands fail intermittently | Check bulb power, BLE range, USB power, and competing controllers. Firmware reconnects automatically; backoff can take up to a minute between attempts. |
-| Several light changes take time | Commands are queued with a 500 ms minimum interval per board. Reconnection adds further delay. |
+| Commands fail intermittently | Check bulb power, BLE range, USB power, and competing controllers. Firmware reconnects automatically in the background, about every 20 seconds once a bulb has been gone for a while. Commands to a bulb that is still reconnecting fail immediately. |
+| Several light changes take time | Commands are queued with a 500 ms minimum interval per board. |
 | HA state differs from the bulb | State is optimistic; external power/color changes are not read back. |
 
 Opening a serial connection can reset an ESP32. Provision and test it before handing the port to Home Assistant. Debug disconnect is temporary: the background monitor will try to reconnect the bulb.

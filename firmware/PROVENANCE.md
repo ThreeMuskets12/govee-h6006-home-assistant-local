@@ -33,6 +33,23 @@ These hashes identify the original files; timestamps alone do not establish a ve
 | govee_controller_serial4 | 2026-01-31 | `fb292f96b816e399d9d949dc163b325d3634ac049f2808aab4e4d593dac30e00` |
 | FinalGovee / selected | 2026-02-12 | `e1f7a30ae17f4781d5bcf169fffb19ceb828b0decc297e16796feb9694ca40b2` |
 
+## Changes since recovery
+
+The hashes above identify the recovered source, not the current sketch. To stop a
+missing bulb from degrading the others on its board, the current sketch:
+
+- applies `CONNECT_TIMEOUT` (5 s instead of NimBLE's 30 s default);
+- serializes connection attempts on a separate `connectMutex`, so `bleMutex` is never
+  held across a blocking BLE call;
+- leaves reconnecting to `BLEMonitor`, so `loop()` never connects inline for a command;
+- shortens the slow reconnect interval from 60 s to 20 s, now that attempts are brief;
+- handles `createClient()` returning `nullptr` and `onDisconnect` clearing `writeChar`.
+
+`DEBUG=0` builds with a saved config also skip the setup window, so polls can't enter it.
+
+NVS keys and the serial protocol are unchanged. The verification below describes the
+recovered source. These changes compile but have not been run on hardware.
+
 ## Verification and limits
 
 - Read-only inspection of the owner's Home Assistant found `esp32_bulb_relay`
