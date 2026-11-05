@@ -20,6 +20,7 @@ from .const import (
     COMMAND_TIMEOUT,
     DEFAULT_BAUD_RATE,
     DEFAULT_TIMEOUT,
+    POLL_TIMEOUT,
 )
 from .queue import CommandQueue
 
@@ -37,8 +38,16 @@ class ESP32BulbRelayConnectionError(ESP32BulbRelayApiError):
     """Exception for connection errors."""
 
 
+class ESP32BulbRelayTimeoutError(ESP32BulbRelayConnectionError):
+    """The ESP32 did not answer in time; it may still act on the command later."""
+
+
 class ESP32BulbRelayCommandError(ESP32BulbRelayApiError):
     """Exception for command failures."""
+
+
+class ESP32BulbRelayBulbNotFoundError(ESP32BulbRelayCommandError):
+    """This ESP32 does not have the bulb, so it may have moved to another port."""
 
 
 class ESP32BulbRelaySerialApi:
@@ -59,6 +68,9 @@ class ESP32BulbRelaySerialApi:
         self._lock = asyncio.Lock()
         self._command_queue = CommandQueue()
         self._connected = False
+        # A timed-out command's reply may still arrive. The firmware has no request
+        # IDs, but it answers in order, so a /bulbs reply proves the stream is in sync.
+        self._resync_needed = False
         _LOGGER.debug("API client initialized for port %s", port)
 
     async def connect(self) -> None:
@@ -263,80 +275,20 @@ class ESP32BulbRelaySerialApi:
                 # Clear any pending data
                 await self._clear_buffer()
                 
-                # Send command with newline
-                cmd_bytes = f"{command}\n".encode('utf-8')
-                _LOGGER.info("Sending to %s: %s", self._port, command)
-                self._writer.write(cmd_bytes)
-                await self._writer.drain()
-                _LOGGER.debug("Command sent and drained on %s", self._port)
+                # Don't queue a command behind one the ESP32 hasn't finished: it would
+                # run late, and its reply couldn't be told from the earlier one's.
+                if self._resync_needed and command != CMD_BULBS:
+                    await self._exchange(CMD_BULBS, POLL_TIMEOUT)
                 
-                # Read response with timeout
-                start_time = asyncio.get_event_loop().time()
-                attempts = 0
-                max_attempts = 100
-                
-                while attempts < max_attempts:
-                    # Check overall timeout
-                    elapsed = asyncio.get_event_loop().time() - start_time
-                    if elapsed > timeout:
-                        _LOGGER.error("Overall timeout after %.1fs on %s", elapsed, self._port)
-                        raise ESP32BulbRelayConnectionError(
-                            f"Timeout waiting for response from {self._port}"
-                        )
-                    
-                    attempts += 1
-                    remaining_timeout = min(5.0, timeout - elapsed)
-                    
-                    _LOGGER.debug("Read attempt %d on %s (%.1fs remaining)", 
-                                 attempts, self._port, timeout - elapsed)
-                    
-                    line = await self._read_line_safe(timeout=remaining_timeout)
-                    
-                    if line is None:
-                        _LOGGER.debug("No data received on attempt %d from %s", attempts, self._port)
-                        continue
-                    
-                    # Try to decode as UTF-8
-                    try:
-                        line_str = line.decode('utf-8', errors='ignore').strip()
-                    except Exception as decode_err:
-                        _LOGGER.debug("Decode error on %s: %s", self._port, decode_err)
-                        continue
-                    
-                    if not line_str:
-                        continue
-                    
-                    # Log what we received
-                    if len(line_str) > 200:
-                        _LOGGER.debug("Received from %s: %s... (%d chars)", 
-                                     self._port, line_str[:200], len(line_str))
-                    else:
-                        _LOGGER.debug("Received from %s: %s", self._port, line_str)
-                    
-                    # Skip lines that don't look like JSON
-                    if not (line_str.startswith('{') or line_str.startswith('[')):
-                        _LOGGER.debug("Skipping non-JSON line from %s", self._port)
-                        continue
-                    
-                    # Try to parse as JSON
-                    try:
-                        result = json.loads(line_str)
-                        _LOGGER.info("Valid JSON response from %s: %s", self._port, result)
-                        return result
-                    except json.JSONDecodeError as json_err:
-                        _LOGGER.debug("JSON parse error on %s: %s", self._port, json_err)
-                        continue
-                
-                _LOGGER.error("No valid JSON after %d attempts on %s", max_attempts, self._port)
-                raise ESP32BulbRelayConnectionError(
-                    f"No valid JSON response after {max_attempts} attempts from {self._port}"
-                )
+                return await self._exchange(command, timeout)
                             
             except ESP32BulbRelayConnectionError:
+                self._resync_needed = True
                 raise
             except asyncio.TimeoutError:
                 _LOGGER.error("Asyncio timeout on %s", self._port)
-                raise ESP32BulbRelayConnectionError(
+                self._resync_needed = True
+                raise ESP32BulbRelayTimeoutError(
                     f"Timeout waiting for response from {self._port}"
                 )
             except Exception as err:
@@ -347,6 +299,86 @@ class ESP32BulbRelaySerialApi:
                 ) from err
             finally:
                 _LOGGER.debug("Released lock for %s", self._port)
+
+    async def _exchange(self, command: str, timeout: float) -> dict[str, Any]:
+        """Write one command and read its reply. The API lock must be held."""
+        # Send command with newline
+        cmd_bytes = f"{command}\n".encode('utf-8')
+        _LOGGER.info("Sending to %s: %s", self._port, command)
+        self._writer.write(cmd_bytes)
+        await self._writer.drain()
+        _LOGGER.debug("Command sent and drained on %s", self._port)
+        
+        # Read response with timeout
+        start_time = asyncio.get_event_loop().time()
+        attempts = 0
+        max_attempts = 100
+        
+        while attempts < max_attempts:
+            # Check overall timeout
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed > timeout:
+                _LOGGER.error("Overall timeout after %.1fs on %s", elapsed, self._port)
+                raise ESP32BulbRelayTimeoutError(
+                    f"Timeout waiting for response from {self._port}"
+                )
+            
+            attempts += 1
+            remaining_timeout = min(5.0, timeout - elapsed)
+            
+            _LOGGER.debug("Read attempt %d on %s (%.1fs remaining)", 
+                         attempts, self._port, timeout - elapsed)
+            
+            line = await self._read_line_safe(timeout=remaining_timeout)
+            
+            if line is None:
+                _LOGGER.debug("No data received on attempt %d from %s", attempts, self._port)
+                continue
+            
+            # Try to decode as UTF-8
+            try:
+                line_str = line.decode('utf-8', errors='ignore').strip()
+            except Exception as decode_err:
+                _LOGGER.debug("Decode error on %s: %s", self._port, decode_err)
+                continue
+            
+            if not line_str:
+                continue
+            
+            # Log what we received
+            if len(line_str) > 200:
+                _LOGGER.debug("Received from %s: %s... (%d chars)", 
+                             self._port, line_str[:200], len(line_str))
+            else:
+                _LOGGER.debug("Received from %s: %s", self._port, line_str)
+            
+            # Skip lines that don't look like JSON
+            if not (line_str.startswith('{') or line_str.startswith('[')):
+                _LOGGER.debug("Skipping non-JSON line from %s", self._port)
+                continue
+            
+            # Try to parse as JSON
+            try:
+                result = json.loads(line_str)
+            except json.JSONDecodeError as json_err:
+                _LOGGER.debug("JSON parse error on %s: %s", self._port, json_err)
+                continue
+            
+            # A late reply to a timed-out command can't answer this one
+            is_bulb_list = isinstance(result, dict) and "bulbs" in result
+            if is_bulb_list != (command == CMD_BULBS):
+                _LOGGER.debug("Skipping late reply from %s: %s", self._port, result)
+                continue
+            
+            if is_bulb_list:
+                self._resync_needed = False
+            _LOGGER.info("Valid JSON response from %s: %s", self._port, result)
+            return result
+        
+        _LOGGER.error("No valid JSON after %d attempts on %s", max_attempts, self._port)
+        raise ESP32BulbRelayConnectionError(
+            f"No valid JSON response after {max_attempts} attempts from {self._port}"
+        )
 
     async def _queued_command(self, command: str) -> dict[str, Any]:
         """Send a rate-limited command through the queue.
@@ -359,6 +391,10 @@ class ESP32BulbRelaySerialApi:
 
     def _check_success(self, result: dict[str, Any], action: str) -> None:
         """Check if the command was successful."""
+        if result.get("error") == "Bulb not found":
+            raise ESP32BulbRelayBulbNotFoundError(
+                f"Command '{action}' failed: bulb not found on {self._port}"
+            )
         if not result.get("success", False):
             raise ESP32BulbRelayCommandError(
                 f"Command '{action}' failed for bulb '{result.get('bulb', 'unknown')}'"

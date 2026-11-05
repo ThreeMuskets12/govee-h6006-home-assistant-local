@@ -10,10 +10,12 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.device_registry import DeviceEntry
 
 from .api import ESP32BulbRelaySerialApi
 from .const import (
     ATTR_BULB_NAME,
+    BULB_DEVICE_PREFIX,
     CONF_BULBS,
     CONF_SERIAL_PORTS,
     DOMAIN,
@@ -115,14 +117,19 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
     """Handle options update."""
     coordinator: ESP32BulbRelayCoordinator = hass.data[DOMAIN][entry.entry_id]
     
-    # Update enabled bulbs
     enabled_bulbs = set(entry.options.get(CONF_BULBS, []))
-    coordinator.set_enabled_bulbs(enabled_bulbs)
-    
-    # Update serial ports if changed
     new_ports = entry.data.get(CONF_SERIAL_PORTS, [])
     current_ports = coordinator.serial_ports
     
+    # Device removal applies its change directly. Reloading would reopen every serial
+    # port, which can reset the ESP32s and drop all of their bulbs.
+    if enabled_bulbs == coordinator.get_enabled_bulbs() and set(new_ports) == set(current_ports):
+        return
+    
+    # Update enabled bulbs
+    coordinator.set_enabled_bulbs(enabled_bulbs)
+    
+    # Update serial ports if changed
     # Add new ports
     for port in new_ports:
         if port not in current_ports:
@@ -144,6 +151,45 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
     
     # Reload the integration to recreate entities
     await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: ConfigEntry, device_entry: DeviceEntry
+) -> bool:
+    """Allow removing a device once no board reports its bulb."""
+    coordinator: ESP32BulbRelayCoordinator | None = hass.data.get(DOMAIN, {}).get(
+        entry.entry_id
+    )
+    if coordinator is None:
+        _LOGGER.warning("Can't remove %s: integration not loaded", device_entry.name)
+        return False
+    
+    bulb_names = {
+        identifier.removeprefix(BULB_DEVICE_PREFIX)
+        for domain, identifier in device_entry.identifiers
+        if domain == DOMAIN and identifier.startswith(BULB_DEVICE_PREFIX)
+    }
+    
+    # Ask the boards now: coordinator.data can be a poll interval old, and a board
+    # that doesn't answer could be the one holding this bulb
+    reported = await coordinator.async_rescan_all_ports()
+    if not coordinator.all_ports_online:
+        _LOGGER.warning("Can't remove %s: not every ESP32 answered", device_entry.name)
+        return False
+    
+    if present := bulb_names & reported.keys():
+        _LOGGER.warning("Can't remove %s: reported by an ESP32", ", ".join(sorted(present)))
+        return False
+    
+    enabled_bulbs = list(entry.options.get(CONF_BULBS, []))
+    remaining_bulbs = [bulb for bulb in enabled_bulbs if bulb not in bulb_names]
+    if remaining_bulbs != enabled_bulbs:
+        coordinator.set_enabled_bulbs(set(remaining_bulbs))
+        hass.config_entries.async_update_entry(
+            entry, options={**entry.options, CONF_BULBS: remaining_bulbs}
+        )
+    
+    return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

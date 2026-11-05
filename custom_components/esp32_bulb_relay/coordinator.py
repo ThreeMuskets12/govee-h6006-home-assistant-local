@@ -9,8 +9,14 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import ESP32BulbRelaySerialApi, ESP32BulbRelayApiError
-from .const import DOMAIN, UPDATE_INTERVAL, POLL_TIMEOUT
+from .api import (
+    ESP32BulbRelayApiError,
+    ESP32BulbRelayBulbNotFoundError,
+    ESP32BulbRelayCommandError,
+    ESP32BulbRelaySerialApi,
+    ESP32BulbRelayTimeoutError,
+)
+from .const import DOMAIN, MAX_MISSED_SCANS, UPDATE_INTERVAL, POLL_TIMEOUT
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,11 +47,17 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._bulb_data: dict[str, dict[str, Any]] = {}  # bulb_name -> bulb info
         self._enabled_bulbs: set[str] = set()  # Bulb names user has enabled
         self._port_online: dict[str, bool] = {}  # port -> online status
+        self._missed_scans: dict[str, int] = {}  # port -> consecutive failed scans
 
     @property
     def serial_ports(self) -> list[str]:
         """Return the list of configured serial ports."""
         return self._serial_ports.copy()
+
+    @property
+    def all_ports_online(self) -> bool:
+        """Return True if every configured port answered its last scan."""
+        return all(self._port_online.get(port, False) for port in self._serial_ports)
 
     @property
     def bulb_port_map(self) -> dict[str, str]:
@@ -92,6 +104,7 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Don't await close here, just remove reference
             self._apis.pop(port, None)
         self._port_online.pop(port, None)
+        self._missed_scans.pop(port, None)
 
     def enable_bulb(self, bulb_name: str) -> None:
         """Enable a bulb."""
@@ -123,6 +136,7 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.debug("Querying /bulbs on port %s (timeout=%ds)", port, POLL_TIMEOUT)
             bulbs = await api.get_bulbs(timeout=POLL_TIMEOUT)
             self._port_online[port] = True
+            self._missed_scans[port] = 0
             
             _LOGGER.info(
                 "Port %s scan successful: %d bulbs found: %s",
@@ -135,6 +149,7 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except ESP32BulbRelayApiError as err:
             _LOGGER.warning("Failed to scan port %s: %s", port, err)
             self._port_online[port] = False
+            self._missed_scans[port] = self._missed_scans.get(port, 0) + 1
             return []
 
     async def async_rescan_all_ports(self) -> dict[str, str]:
@@ -165,9 +180,22 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         
             except Exception as err:
                 _LOGGER.error("Error scanning port %s: %s", port, err)
+                self._port_online[port] = False
+                self._missed_scans[port] = self._missed_scans.get(port, 0) + 1
         
         # Update the mappings
         old_mapping = self._bulb_port_map
+        
+        # A board that missed a scan is busy, not empty: keep routing to its other bulbs
+        for bulb_name, port in old_mapping.items():
+            if (
+                bulb_name not in new_mapping
+                and port in self._serial_ports
+                and 0 < self._missed_scans.get(port, 0) <= MAX_MISSED_SCANS
+            ):
+                new_mapping[bulb_name] = port
+                new_bulb_data[bulb_name] = self._bulb_data[bulb_name]
+        
         self._bulb_port_map = new_mapping
         self._bulb_data = new_bulb_data
         
@@ -297,23 +325,37 @@ class ESP32BulbRelayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         
         try:
             return await method(bulb_name, *args, **kwargs)
-        except ESP32BulbRelayApiError:
-            # Command failed, maybe bulb moved to different port
-            _LOGGER.debug(
-                "Command '%s' failed for bulb '%s', rescanning ports...",
-                command_func, bulb_name
-            )
-            await self.async_rescan_all_ports()
-            
-            # Try again with potentially new port
-            api = self.get_api_for_bulb(bulb_name)
-            if api is None:
-                raise ESP32BulbRelayApiError(
-                    f"Bulb '{bulb_name}' not found on any configured port after rescan"
-                )
-            
-            method = getattr(api, command_func)
+        except ESP32BulbRelayBulbNotFoundError:
+            pass
+        except ESP32BulbRelayTimeoutError:
+            # The board is busy; rescanning every port can't help.
+            raise
+        except ESP32BulbRelayCommandError:
+            # The bulb is on this port, so a rescan can't help here either. Older
+            # firmware fails healthy bulbs while reconnecting another, so give a bulb
+            # that last reported connected one more try.
+            if not self._bulb_data.get(bulb_name, {}).get("connected"):
+                raise
             return await method(bulb_name, *args, **kwargs)
+        except ESP32BulbRelayApiError:
+            pass
+        
+        # Command failed, maybe bulb moved to different port
+        _LOGGER.debug(
+            "Command '%s' failed for bulb '%s', rescanning ports...",
+            command_func, bulb_name
+        )
+        await self.async_rescan_all_ports()
+        
+        # Try again with potentially new port
+        api = self.get_api_for_bulb(bulb_name)
+        if api is None:
+            raise ESP32BulbRelayApiError(
+                f"Bulb '{bulb_name}' not found on any configured port after rescan"
+            )
+        
+        method = getattr(api, command_func)
+        return await method(bulb_name, *args, **kwargs)
 
     async def async_connect_bulb(self, bulb_name: str) -> dict[str, Any]:
         """Connect a bulb (debug function)."""

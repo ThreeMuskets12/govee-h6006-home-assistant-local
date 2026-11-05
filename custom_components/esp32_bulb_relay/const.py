@@ -7,6 +7,9 @@ CONF_SERIAL_PORT = "serial_port"
 CONF_SERIAL_PORTS = "serial_ports"  # List of ports to scan
 CONF_BULBS = "bulbs"  # Flat list of bulb names (not grouped by port)
 
+# Device registry identifier for a bulb: BULB_DEVICE_PREFIX + bulb name
+BULB_DEVICE_PREFIX = "bulb_"
+
 # Default values
 DEFAULT_BAUD_RATE = 115200
 
@@ -21,6 +24,10 @@ COMMAND_TIMEOUT = 15  # For on/off/brightness/color commands
 
 # Status poll timeout - shorter since we poll frequently
 POLL_TIMEOUT = 5  # For /bulbs status queries
+
+# Consecutive failed polls a port's bulbs stay routed through. A missed poll usually
+# means the board is busy; three spans the original firmware's 91.5 s worst-case stall.
+MAX_MISSED_SCANS = 3
 
 # API Commands
 CMD_BULBS = "/bulbs"

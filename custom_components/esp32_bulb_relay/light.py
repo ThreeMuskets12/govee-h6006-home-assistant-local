@@ -19,6 +19,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .api import ESP32BulbRelayApiError
 from .const import (
+    BULB_DEVICE_PREFIX,
     CONF_BULBS,
     DOMAIN,
     MAX_COLOR_TEMP_KELVIN,
@@ -83,7 +84,7 @@ class ESP32BulbRelayLight(CoordinatorEntity[ESP32BulbRelayCoordinator], LightEnt
         
         # Device info
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"bulb_{bulb_name}")},
+            identifiers={(DOMAIN, f"{BULB_DEVICE_PREFIX}{bulb_name}")},
             name=bulb_name,
             manufacturer="ESP32 Bulb Relay",
             model="Smart Bulb",
